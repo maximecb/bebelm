@@ -1,0 +1,18 @@
+[package]
+name = "bebelm"
+version = "0.1.0"
+edition = "2021"
+description = "CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M)"
+
+[dependencies]
+# mmap the (~5 GB) GGUF read-only: lazy paging, shared page cache, no upfront read+alloc.
+# Pure Rust; FFI into the already-present system libc (no system package to install).
+memmap2 = "0.9"
+
+# `half` (f16/bf16 -> f32) and `rayon` (phase-2 threading) are added when first used,
+# per design.md, to keep the build minimal.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
