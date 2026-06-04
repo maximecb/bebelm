@@ -5,35 +5,93 @@
 //! the architecture described in design.md.
 
 mod gguf;
+mod kernels;
 mod tensor;
 
 use std::process::ExitCode;
 
 use gguf::{GgufFile, MetaValue};
+use kernels::dequant;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
+    let result = match args.get(1).map(String::as_str) {
         Some("dump") => match args.get(2) {
-            Some(path) => match cmd_dump(path) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            None => {
-                eprintln!("usage: bebelm dump <model.gguf>");
-                ExitCode::FAILURE
-            }
+            Some(path) => cmd_dump(path),
+            None => return usage("dump <model.gguf>"),
+        },
+        Some("dequant") => match (args.get(2), args.get(3)) {
+            (Some(path), Some(name)) => cmd_dequant(path, name),
+            _ => return usage("dequant <model.gguf> <tensor-name>"),
         },
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
-            eprintln!("  bebelm dump <model.gguf>   list metadata and tensors");
+            eprintln!("  bebelm dump    <model.gguf>                 list metadata and tensors");
+            eprintln!("  bebelm dequant <model.gguf> <tensor-name>   dequantize a tensor, print stats");
+            return ExitCode::FAILURE;
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn usage(line: &str) -> ExitCode {
+    eprintln!("usage: bebelm {line}");
+    ExitCode::FAILURE
+}
+
+/// Dequantize a named tensor and print summary statistics — a real-data sanity check on
+/// the dequant kernels (weights should be small, roughly zero-mean).
+fn cmd_dequant(path: &str, name: &str) -> gguf::Result<()> {
+    let g = GgufFile::open(path)?;
+    let Some(t) = g.tensors.iter().find(|t| t.name == name) else {
+        eprintln!("error: no tensor named '{name}'");
+        eprintln!("hint: run `bebelm dump {path}` to list tensor names");
+        std::process::exit(1);
+    };
+
+    if !dequant::supports(t.ggml_type) {
+        eprintln!("error: dequant not implemented for type {}", t.ggml_type);
+        std::process::exit(1);
+    }
+
+    let n = t.n_elements() as usize;
+    let values = dequant::dequantize(t.ggml_type, g.tensor_data(t), n);
+
+    let shape = t.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x");
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut nonfinite = 0usize;
+    for &v in &values {
+        if v.is_finite() {
+            min = min.min(v);
+            max = max.max(v);
+            sum += v as f64;
+        } else {
+            nonfinite += 1;
+        }
+    }
+    let mean = sum / (n.max(1) as f64);
+
+    println!("tensor   : {name}");
+    println!("type     : {}", t.ggml_type);
+    println!("shape    : {shape}  ({n} elements)");
+    println!("min      : {min}");
+    println!("max      : {max}");
+    println!("mean     : {mean:.6}");
+    if nonfinite > 0 {
+        println!("non-finite: {nonfinite}  (UNEXPECTED)");
+    }
+    let head: Vec<String> = values.iter().take(8).map(|v| format!("{v:.5}")).collect();
+    println!("first 8  : [{}]", head.join(", "));
+    Ok(())
 }
 
 fn cmd_dump(path: &str) -> gguf::Result<()> {

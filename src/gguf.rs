@@ -134,7 +134,6 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
-    #[allow(dead_code)] // used for buffer sizing in the matmul/dequant kernels (next milestone)
     pub fn n_elements(&self) -> u64 {
         self.dims.iter().product()
     }
@@ -158,9 +157,6 @@ impl std::ops::Deref for Backing {
 
 /// A parsed GGUF file. Holds the mmap alive and indexes into it for tensor data.
 pub struct GgufFile {
-    // Read via `tensor_data`; that accessor is consumed by the dequant kernels in the
-    // next milestone, so it reads as dead in the current `dump`-only binary.
-    #[allow(dead_code)]
     backing: Backing,
     pub version: u32,
     pub alignment: u64,
@@ -192,7 +188,6 @@ impl GgufFile {
     }
 
     /// Zero-copy view of a tensor's raw (still-quantized) bytes.
-    #[allow(dead_code)] // consumed by the dequant kernels in the next milestone
     pub fn tensor_data(&self, t: &TensorInfo) -> &[u8] {
         &self.backing[t.data_start as usize..(t.data_start + t.data_len) as usize]
     }

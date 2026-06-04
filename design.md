@@ -331,9 +331,12 @@ Pure Rust, no system packages. Each justified; minimal tree.
 
 | Crate | Phase | Why | System deps? |
 |---|---|---|---|
-| `half` | core | f16 (GGUF scales) & bf16 → f32 with correct subnormal/inf/nan | None (pure Rust). Hand-rollable in ~20 lines if we want zero deps. |
 | `memmap2` | core | mmap the ~5 GB GGUF: lazy paging, shared page cache, no 5 GB upfront read+alloc | None — pure-Rust FFI to system libc; nothing to install. |
 | `rayon` | phase 2 (opt) | data-parallel matmul rows / per-expert / per-head work across cores | None — built on std threads. |
+
+> `half` was **dropped**: the file has no F16/BF16 whole tensors, so we only need f16→f32
+> for in-block scales — hand-rolled as a tested ~25-line `f16_to_f32` in
+> `kernels/dequant.rs`. Current dependency tree is just `memmap2` (+ `rayon` later).
 
 **Deliberately NOT taking crates for:**
 
@@ -387,7 +390,9 @@ src/
 
 1. ✅ **GGUF loader + tensor dump.** Parse header, list tensors (name/dtype/shape);
    confirmed the Q4_K/Q6_K/F32 mix and the verified tensor-name mapping above.
-2. **Dequant kernels** (Q4_K, Q6_K, f16) with unit tests against known blocks.
+2. ✅ **Dequant kernels** (`kernels/dequant.rs`): hand-rolled `f16_to_f32`, Q4_K + Q6_K
+   block decoders (exact ggml reference) + an F32/F16/Q4_K/Q6_K dispatcher. Unit-tested on
+   synthetic blocks and validated on real tensors via `bebelm dequant <file> <tensor>`.
 3. **Quantized GEMV** + RMSNorm; validate against hand-computed small cases.
 4. **Single forward pass, single token** (no cache): embed → 24 layers → final norm →
    logits. Compare top-token / logits to a reference on a fixed token sequence.
