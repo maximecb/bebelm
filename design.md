@@ -407,8 +407,9 @@ src/
    " the city of Paris" (fluent + factually correct), validating the whole pipeline.
 9. **Optimizations** (sub-items 9a–9h in the *Optimizations* section above; ordered
    easiest-first with impact estimates). Baseline already has MoE sparsity + caches;
-   suggested next: 9a/9b (quick), 9c (`rayon`, biggest win), then 9d/9e (`wide` SIMD +
-   fusion). Cross-platform portable SIMD via the `wide` crate, not `std::arch`.
+   9a/9b/9c done (`rayon` row-parallel `matvec` landed the biggest win); suggested next:
+   9d/9e (`wide` SIMD + fusion). Cross-platform portable SIMD via the `wide` crate, not
+   `std::arch`.
   - TODO: break this down into sub-steps
   - llama.cpp has a custom GEMM (matrix multiply) and MoE routing kernels tuned for
     hybrid (convolution + attention) architecture. We could potentially take inspiration
@@ -431,7 +432,7 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 |---|---|---|---|
 | **9a ✅** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul (`run_layers` vs `forward_step`); skip it for the rest. | trivial | **measured ~13% faster prefill** (0.8→0.9 tok/s, 6-tok prompt); no decode effect |
 | **9b ✅** | **Precompute small F32 tensors at load** — dequantize the F32 norm/conv/bias tensors once into `Model` (~0.85 MB; router excluded) and read via `f32()`; removed `dequant_vec` + ~101 allocs/token. See notes. | easy | **measured: within noise** — F32 work is dwarfed by the matmuls; cleaner code, no speed change |
-| **9c** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). | easy | **HIGH ≈ core count** (≈4–8× here) |
+| **9c ✅** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). Serial fallback below 64 rows (router, k/v proj). | easy | **measured ~5.3× decode** (0.87→4.6 tok/s) + ~5–6× prefill on 10 cores (4P+6E); ids bit-identical |
 | **9d** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | ~2–4× on `matvec`; multiplies with 9c |
 | **9e** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | ~1.3–2×; combines with 9d |
 | **9f** | **Batched GEMM prefill** — dequantize each weight row once and apply to all prompt tokens at once (vs. once per token). | moderate | prefill only: ≈ prompt-length×; no decode effect |

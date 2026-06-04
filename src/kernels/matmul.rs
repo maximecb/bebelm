@@ -5,11 +5,18 @@
 //! product of contiguous weight row `o` with `x`. Quantization runs along `in_features`, so
 //! each row is a whole number of 256-weight K-quant super-blocks.
 //!
-//! Milestone 3 keeps it simple: dequantize one row into a reused buffer, then dot. The
-//! design's fused dequant-and-accumulate (and batched GEMM for prefill) come in phase 2.
+//! Each output row is independent — dequantize its weight row into a scratch buffer, then
+//! dot with `x` — so the row loop runs across CPU cores via rayon. Partitioning by row
+//! leaves every dot's accumulation order unchanged, so the result is bit-for-bit identical
+//! to the serial path regardless of thread count.
 
 use crate::kernels::dequant;
 use crate::tensor::GgmlType;
+use rayon::prelude::*;
+
+/// Below this many output rows, dispatching work to the thread pool costs more than the
+/// rows save, so `matvec` runs serially (the router and k/v projections fall here).
+const PAR_MIN_ROWS: usize = 64;
 
 /// Dot product of two equal-length `f32` slices.
 #[inline]
@@ -32,11 +39,25 @@ pub fn matvec(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], y
     assert_eq!(n_in % blk_elems, 0, "matvec: n_in ({n_in}) not a multiple of block ({blk_elems})");
     let row_bytes = (n_in / blk_elems) * blk_bytes as usize;
 
-    let mut row = vec![0.0f32; n_in];
-    for (o, yo) in y.iter_mut().enumerate() {
+    // One output row: dequantize weight row `o` into `scratch`, then dot with `x`.
+    let compute_row = |o: usize, scratch: &mut [f32]| -> f32 {
         let off = o * row_bytes;
-        dequant::dequantize_into(dtype, &w[off..off + row_bytes], &mut row);
-        *yo = dot(&row, x);
+        dequant::dequantize_into(dtype, &w[off..off + row_bytes], scratch);
+        dot(scratch, x)
+    };
+
+    if n_out < PAR_MIN_ROWS {
+        let mut scratch = vec![0.0f32; n_in];
+        for (o, yo) in y.iter_mut().enumerate() {
+            *yo = compute_row(o, &mut scratch);
+        }
+    } else {
+        // Rows are independent; each worker keeps its own scratch buffer (allocated once
+        // per bout of work and reused across that bout's rows).
+        y.par_iter_mut().enumerate().for_each_init(
+            || vec![0.0f32; n_in],
+            |scratch, (o, yo)| *yo = compute_row(o, scratch),
+        );
     }
 }
 

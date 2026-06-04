@@ -9,8 +9,9 @@ description = "CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M
 # Pure Rust; FFI into the already-present system libc (no system package to install).
 memmap2 = "0.9"
 
-# `half` (f16/bf16 -> f32) and `rayon` (phase-2 threading) are added when first used,
-# per design.md, to keep the build minimal.
+# Data-parallel iterators on a persistent thread pool. Pure Rust, built on std threads;
+# no system package to install.
+rayon = "1"
 
 # Fully optimize the dependencies in debug mode
 [profile.dev.package."*"]

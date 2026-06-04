@@ -8,18 +8,19 @@
 # Usage: ./benchmark.sh [path/to/model.gguf]
 #
 # Determinism: greedy decoding (temperature 0) is bit-identical run-to-run on the same
-# binary/machine (pure f32, single-thread scalar, no RNG). `rayon` row-parallelism (opt
-# 9c) preserves this, but SIMD (9d) / FMA contraction can shift the exact tokens — if the
-# matmul math changes, update EXPECTED below.
+# binary/machine (pure f32, no RNG). Parallelizing matvec over output rows preserves this
+# (each row's accumulation order is unchanged); a later move to SIMD / FMA contraction
+# could shift the exact tokens — if the matmul math changes, update EXPECTED below.
 
 set -euo pipefail
 
 MODEL="${1:-models/LFM2.5-8B-A1B-Q4_K_M.gguf}"
-PROMPT="The capital of France is"
-MAX_NEW=8
-# Expected greedy token ids (deterministic on single-core scalar f32). Robust to text
-# formatting; keep in sync with PROMPT/MAX_NEW. Decodes to " the city of Paris. city of Paris".
-EXPECTED_IDS="[278, 3270, 302, 4741, 22, 3270, 302, 4741]"
+PROMPT="Tell me about the capital of France"
+MAX_NEW=16
+# Expected greedy token ids (deterministic: f32, row-parallel matvec, no RNG). Robust to
+# text formatting; keep in sync with PROMPT/MAX_NEW. Decodes to ", Paris. Provide a detailed
+# description, description of its architecture, and a list".
+EXPECTED_IDS="[20, 4741, 22, 43972, 267, 9688, 8818, 20, 8818, 302, 851, 10957, 20, 309, 267, 1815]"
 
 if [ ! -f "$MODEL" ]; then
     echo "error: model not found: $MODEL" >&2

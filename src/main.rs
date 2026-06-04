@@ -123,7 +123,7 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
     }
 
     let model = Model::load(path)?;
-    eprintln!("greedy-generating up to {max_new} token(s) (cached, single-core)...");
+    eprintln!("greedy-generating up to {max_new} token(s) (cached, multi-threaded)...");
     let mut sampler = Sampler::greedy();
     let generated = model.generate(&prompt, &mut sampler, max_new, config::EOS_TOKEN);
 
@@ -160,7 +160,7 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
     let tok = Tokenizer::from_gguf(model.gguf())?;
     let prompt = tok.encode(&text, true);
     eprintln!(
-        "prompt = {} tokens; greedy-generating up to {max_new} (cached, single-core)...",
+        "prompt = {} tokens; greedy-generating up to {max_new} (cached, multi-threaded)...",
         prompt.len()
     );
     println!("prompt       : {text:?}");
@@ -201,7 +201,7 @@ fn cmd_logits(path: &str, token_args: &[String]) -> Cmd {
 
     let model = Model::load(path)?;
     eprintln!(
-        "running forward pass on {} token(s) (unoptimized, single-core; may take a while)...",
+        "running forward pass on {} token(s) (uncached, multi-threaded; may take a while)...",
         tokens.len()
     );
     let logits = model.forward(&tokens);
