@@ -2,4 +2,8 @@
 /models
 *.gguf
 
+# profile.sh output
+/profile.txt
+/profile.demangled.txt
+
 TODO.txt
