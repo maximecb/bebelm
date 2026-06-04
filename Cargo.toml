@@ -12,6 +12,17 @@ memmap2 = "0.9"
 # `half` (f16/bf16 -> f32) and `rayon` (phase-2 threading) are added when first used,
 # per design.md, to keep the build minimal.
 
+# Fully optimize the dependencies in debug mode
+[profile.dev.package."*"]
+opt-level = 3
+
+# Low optimization level in debug mode
+# Level 1 is much faster than no optimization,
+# But still ok for stepping through when debugging
+[profile.dev]
+opt-level = 1
+debug = true
+
 [profile.release]
 opt-level = 3
 lto = "thin"
