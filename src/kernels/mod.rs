@@ -5,4 +5,5 @@ pub mod dequant;
 pub mod elementwise;
 pub mod matmul;
 pub mod rmsnorm;
+pub mod rope;
 pub mod softmax;
