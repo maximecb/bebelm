@@ -211,6 +211,28 @@ impl GgufFile {
         }
     }
 
+    /// Read an array-valued metadata entry as `u32`s (e.g. the per-layer kv-head counts).
+    pub fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        let MetaValue::Array { items, .. } = self.get(key)? else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            out.push(match it {
+                MetaValue::U8(v) => *v as u32,
+                MetaValue::U16(v) => *v as u32,
+                MetaValue::U32(v) => *v,
+                MetaValue::U64(v) => *v as u32,
+                MetaValue::I8(v) => *v as u32,
+                MetaValue::I16(v) => *v as u32,
+                MetaValue::I32(v) => *v as u32,
+                MetaValue::I64(v) => *v as u32,
+                _ => return None,
+            });
+        }
+        Some(out)
+    }
+
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         match self.get(key)? {
             MetaValue::F32(v) => Some(*v),

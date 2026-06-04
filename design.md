@@ -377,8 +377,8 @@ src/
   main.rs            # ✓ CLI: dump + dequant (later: load model, prompt, generate)
   gguf.rs            # ✓ GGUF parser + mmap-backed tensor table
   tensor.rs          # ✓ dtype enum + block sizing
-  config.rs          #   model hyperparameters (read from GGUF metadata)
-  model.rs           #   weights, layer schedule, forward pass, MoE routing
+  config.rs          # ✓ hardcoded architecture consts + validate(&gguf)
+  model.rs           # ◐ weight loading by name + shape check (forward pass next)
   cache.rs           #   KV cache + conv-state cache
   sampler.rs         #   temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
   tokenizer.rs       #   (phase 2) byte-level BPE from GGUF metadata
@@ -401,12 +401,30 @@ src/
    `matvec(dtype, W, n_in, n_out, x, y)` (dequantize-row-then-dot, reused buffer) and
    `rmsnorm(x, gain, eps, out)`. Unit-tested on hand-computed cases (incl. row-major
    layout check). Also restructured into a lib crate + thin bin (clean dead-code story).
-4. **Single forward pass, single token** (no cache): embed → 24 layers → final norm →
-   logits. Compare top-token / logits to a reference on a fixed token sequence.
-5. **Conv, attention (+RoPE, q/k norm), MoE routing** wired into the layer schedule.
+4. ✅ **Config + model loading** (`config.rs`, `model.rs`): architecture as hardcoded
+   `const`s + `validate(&gguf)`; `Model::load` resolves all 256 tensors by name and
+   checks shapes. `bebelm load` confirmed it against the real file. (We chose a **static
+   forward pass** — see note below — rather than runtime config interpretation.)
+5. **Remaining kernels + single forward pass** (no cache): `rope`, `softmax`,
+   `activation` (SiLU/SwiGLU), `elementwise`, `conv`, `attention`; wire the static layer
+   loop (embed → 24 layers → final norm → logits) incl. MoE routing. Validate logits
+   against a reference (throwaway HF `transformers` script) on a fixed token sequence.
 6. **KV + conv-state caches**; multi-token prefill then incremental decode.
 7. **Sampling (temp + top-k, temp 0 = greedy) + generation** on raw token IDs; verify a
    known continuation.
 8. **Tokenizer** (byte-level BPE from GGUF) + chat template → end-to-end text.
 9. **Optimizations:** sparse-expert execution, rayon, SIMD, f16 KV cache.
-```
+  - TODO: break this down into sub-steps
+10. **Cleanup:** remove unused code and validation code that is no longer needed.
+
+### Design note: static forward pass
+
+The architecture is fixed (one target model), so it lives in `config.rs` as compile-time
+`const`s, not runtime-parsed config. The forward pass is written as plain static code
+using those consts (e.g. `const HIDDEN = 2048`, a `const` conv/attn schedule) — **not** a
+code generator and **not** a runtime config interpreter. We still load the ~4.8 GB of
+weights at runtime (they can't live in the binary) and look them up **by name** (offsets
+are file-specific and fragile). `config::validate(&gguf)` asserts the file matches the
+constants at startup, so a wrong/updated file fails loudly. Benefits: const dimensions
+let the compiler elide bounds checks / use fixed-size buffers, and the forward pass stays
+readable and debuggable.

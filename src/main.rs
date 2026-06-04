@@ -1,17 +1,21 @@
 //! bebelm — CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M).
 //!
-//! Milestone 1: a GGUF loader with a `dump` command that lists the file's metadata and
-//! every tensor (name / dtype / shape / size), so we can validate the real model against
-//! the architecture described in design.md.
+//! CLI over the `bebelm` library: inspect a GGUF (`dump`), sanity-check the dequant
+//! kernels on a tensor (`dequant`), or load + validate the whole model (`load`).
 
+use std::error::Error;
 use std::process::ExitCode;
 
-use bebelm::gguf::{self, GgufFile, MetaValue};
+use bebelm::config;
+use bebelm::gguf::{GgufFile, MetaValue};
 use bebelm::kernels::dequant;
+use bebelm::model::Model;
+
+type Cmd = Result<(), Box<dyn Error>>;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let result = match args.get(1).map(String::as_str) {
+    let result: Cmd = match args.get(1).map(String::as_str) {
         Some("dump") => match args.get(2) {
             Some(path) => cmd_dump(path),
             None => return usage("dump <model.gguf>"),
@@ -20,11 +24,16 @@ fn main() -> ExitCode {
             (Some(path), Some(name)) => cmd_dequant(path, name),
             _ => return usage("dequant <model.gguf> <tensor-name>"),
         },
+        Some("load") => match args.get(2) {
+            Some(path) => cmd_load(path),
+            None => return usage("load <model.gguf>"),
+        },
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
             eprintln!("  bebelm dump    <model.gguf>                 list metadata and tensors");
             eprintln!("  bebelm dequant <model.gguf> <tensor-name>   dequantize a tensor, print stats");
+            eprintln!("  bebelm load    <model.gguf>                 load + validate against the config");
             return ExitCode::FAILURE;
         }
     };
@@ -42,9 +51,32 @@ fn usage(line: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Load + validate the model, then print the resolved layer schedule.
+fn cmd_load(path: &str) -> Cmd {
+    Model::load(path)?;
+    let attn = config::ATTENTION_LAYERS;
+    let dense: Vec<usize> = (0..config::N_LAYERS).filter(|&i| config::is_dense_ffn(i)).collect();
+    println!("OK: loaded and validated {path}");
+    println!(
+        "arch={} layers={} hidden={} heads={}/{} experts={}(top-{}) vocab={}",
+        config::ARCH,
+        config::N_LAYERS,
+        config::HIDDEN,
+        config::N_HEADS,
+        config::N_KV_HEADS,
+        config::N_EXPERTS,
+        config::N_EXPERTS_USED,
+        config::VOCAB,
+    );
+    println!("operators: attention at {attn:?}, gated short-conv elsewhere");
+    println!("ffn      : dense at {dense:?}, sparse-MoE elsewhere");
+    println!("all {} expected tensors present with correct shapes", bebelm::model::expected_tensors().len());
+    Ok(())
+}
+
 /// Dequantize a named tensor and print summary statistics — a real-data sanity check on
 /// the dequant kernels (weights should be small, roughly zero-mean).
-fn cmd_dequant(path: &str, name: &str) -> gguf::Result<()> {
+fn cmd_dequant(path: &str, name: &str) -> Cmd {
     let g = GgufFile::open(path)?;
     let Some(t) = g.tensors.iter().find(|t| t.name == name) else {
         eprintln!("error: no tensor named '{name}'");
@@ -90,7 +122,7 @@ fn cmd_dequant(path: &str, name: &str) -> gguf::Result<()> {
     Ok(())
 }
 
-fn cmd_dump(path: &str) -> gguf::Result<()> {
+fn cmd_dump(path: &str) -> Cmd {
     let g = GgufFile::open(path)?;
 
     println!("== {path} ==");
