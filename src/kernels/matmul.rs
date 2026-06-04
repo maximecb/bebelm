@@ -13,16 +13,56 @@
 use crate::kernels::dequant;
 use crate::tensor::GgmlType;
 use rayon::prelude::*;
+use wide::f32x8;
 
 /// Below this many output rows, dispatching work to the thread pool costs more than the
 /// rows save, so `matvec` runs serially (the router and k/v projections fall here).
 const PAR_MIN_ROWS: usize = 64;
 
+/// Read the first 8 elements of `s` as an `f32x8` (one 256-bit / 2× NEON vector).
+#[inline]
+fn load8(s: &[f32]) -> f32x8 {
+    f32x8::from(<[f32; 8]>::try_from(&s[..8]).unwrap())
+}
+
 /// Dot product of two equal-length `f32` slices.
+///
+/// Vectorized with `f32x8` over four independent accumulators (ILP, to hide FMA latency),
+/// with a scalar tail for any remainder. Because this sums lane-wise partial products with
+/// fused multiply-add, the result is **not** bit-identical to a left-to-right scalar dot —
+/// the rounding differs. (Inputs in `matvec` are always a multiple of the 256-wide block,
+/// so the tail there is empty; the tail only serves small/odd callers and tests.)
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+    const W: usize = 8; // f32x8 lane count
+    const STEP: usize = W * 4; // four accumulators per iteration
+    let n = a.len();
+
+    let mut acc0 = f32x8::splat(0.0);
+    let mut acc1 = f32x8::splat(0.0);
+    let mut acc2 = f32x8::splat(0.0);
+    let mut acc3 = f32x8::splat(0.0);
+
+    let mut i = 0;
+    while i + STEP <= n {
+        acc0 = load8(&a[i..]).mul_add(load8(&b[i..]), acc0);
+        acc1 = load8(&a[i + W..]).mul_add(load8(&b[i + W..]), acc1);
+        acc2 = load8(&a[i + 2 * W..]).mul_add(load8(&b[i + 2 * W..]), acc2);
+        acc3 = load8(&a[i + 3 * W..]).mul_add(load8(&b[i + 3 * W..]), acc3);
+        i += STEP;
+    }
+    while i + W <= n {
+        acc0 = load8(&a[i..]).mul_add(load8(&b[i..]), acc0);
+        i += W;
+    }
+
+    let mut sum = ((acc0 + acc1) + (acc2 + acc3)).reduce_add();
+    while i < n {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
 }
 
 /// Compute `y = W·x`, where `W` is `[n_in, n_out]` quantized as `dtype` in `w`.

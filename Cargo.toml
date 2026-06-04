@@ -13,6 +13,10 @@ memmap2 = "0.9"
 # no system package to install.
 rayon = "1"
 
+# Portable SIMD value types (f32x8 etc.) for the matvec dot product. Pure Rust over
+# core::arch compiler intrinsics — no nightly, no system package, no C toolchain.
+wide = "0.7"
+
 # Fully optimize the dependencies in debug mode
 [profile.dev.package."*"]
 opt-level = 3
