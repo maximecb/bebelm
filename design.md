@@ -368,19 +368,23 @@ Pure Rust, no system packages. Each justified; minimal tree.
 
 ## Project layout
 
+A library crate (`lib.rs`) holds everything; `main.rs` is a thin CLI over it (this keeps
+`pub` kernels off the dead-code lint as the model is built bottom-up). `✓` = implemented.
+
 ```
 src/
-  main.rs            # CLI: load model, prompt, generate
-  gguf.rs            # GGUF parser + mmap-backed tensor table
-  tensor.rs          # dtype enum + zero-copy quantized tensor views
-  config.rs          # model hyperparameters
-  model.rs           # weights, layer schedule, forward pass, MoE routing
-  cache.rs           # KV cache + conv-state cache
-  sampler.rs         # one sampler: temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
-  tokenizer.rs       # (phase 2) byte-level BPE from GGUF metadata
+  lib.rs             # ✓ library surface (pub mod gguf/tensor/kernels/…)
+  main.rs            # ✓ CLI: dump + dequant (later: load model, prompt, generate)
+  gguf.rs            # ✓ GGUF parser + mmap-backed tensor table
+  tensor.rs          # ✓ dtype enum + block sizing
+  config.rs          #   model hyperparameters (read from GGUF metadata)
+  model.rs           #   weights, layer schedule, forward pass, MoE routing
+  cache.rs           #   KV cache + conv-state cache
+  sampler.rs         #   temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
+  tokenizer.rs       #   (phase 2) byte-level BPE from GGUF metadata
   kernels/
-    mod.rs
-    dequant.rs  matmul.rs  rmsnorm.rs  rope.rs
+    mod.rs           # ✓
+    dequant.rs ✓  matmul.rs ✓  rmsnorm.rs ✓  rope.rs
     softmax.rs  attention.rs  conv.rs  activation.rs  elementwise.rs
 ```
 
@@ -393,7 +397,10 @@ src/
 2. ✅ **Dequant kernels** (`kernels/dequant.rs`): hand-rolled `f16_to_f32`, Q4_K + Q6_K
    block decoders (exact ggml reference) + an F32/F16/Q4_K/Q6_K dispatcher. Unit-tested on
    synthetic blocks and validated on real tensors via `bebelm dequant <file> <tensor>`.
-3. **Quantized GEMV** + RMSNorm; validate against hand-computed small cases.
+3. ✅ **Quantized GEMV + RMSNorm** (`kernels/matmul.rs`, `kernels/rmsnorm.rs`):
+   `matvec(dtype, W, n_in, n_out, x, y)` (dequantize-row-then-dot, reused buffer) and
+   `rmsnorm(x, gain, eps, out)`. Unit-tested on hand-computed cases (incl. row-major
+   layout check). Also restructured into a lib crate + thin bin (clean dead-code story).
 4. **Single forward pass, single token** (no cache): embed → 24 layers → final norm →
    logits. Compare top-token / logits to a reference on a fixed token sequence.
 5. **Conv, attention (+RoPE, q/k norm), MoE routing** wired into the layer schedule.

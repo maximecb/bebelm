@@ -4,14 +4,10 @@
 //! every tensor (name / dtype / shape / size), so we can validate the real model against
 //! the architecture described in design.md.
 
-mod gguf;
-mod kernels;
-mod tensor;
-
 use std::process::ExitCode;
 
-use gguf::{GgufFile, MetaValue};
-use kernels::dequant;
+use bebelm::gguf::{self, GgufFile, MetaValue};
+use bebelm::kernels::dequant;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();

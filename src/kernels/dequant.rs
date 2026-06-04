@@ -142,12 +142,12 @@ pub fn supports(dtype: GgmlType) -> bool {
     matches!(dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::Q4_K | GgmlType::Q6_K)
 }
 
-/// Dequantize a whole tensor of `n_elements` weights into a fresh `Vec<f32>`.
+/// Dequantize a whole tensor of weights into the caller-provided `out` buffer.
 ///
 /// Panics if `dtype` is not [`supports`]ed — callers should check first. `data` must be
-/// the exact byte slice for the tensor (as sized by [`GgmlType::byte_size`]).
-pub fn dequantize(dtype: GgmlType, data: &[u8], n_elements: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; n_elements];
+/// the exact byte slice for the tensor (as sized by [`GgmlType::byte_size`]), and
+/// `out.len()` the element count.
+pub fn dequantize_into(dtype: GgmlType, data: &[u8], out: &mut [f32]) {
     match dtype {
         GgmlType::F32 => {
             for (o, c) in out.iter_mut().zip(data.chunks_exact(4)) {
@@ -171,6 +171,12 @@ pub fn dequantize(dtype: GgmlType, data: &[u8], n_elements: usize) -> Vec<f32> {
         }
         other => panic!("dequantize: unsupported type {other}"),
     }
+}
+
+/// Dequantize a whole tensor of `n_elements` weights into a fresh `Vec<f32>`.
+pub fn dequantize(dtype: GgmlType, data: &[u8], n_elements: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_elements];
+    dequantize_into(dtype, data, &mut out);
     out
 }
 
