@@ -417,9 +417,12 @@ src/
 
 ## Optimizations
 
-Baseline after milestone 6: single-core scalar, ~1.3 s/token (dominated by `matvec` —
-dequantize-on-the-fly + dot, re-done per token). Already in place: **MoE sparsity** (only
-the top-4 experts run per token) and the **KV + conv-state caches** (decode is O(n)).
+Baseline after milestone 6 (Apple silicon, single-core scalar): **~0.87 tok/s decode**
+(`./benchmark.sh`), dominated by `matvec` (dequantize-on-the-fly + dot, re-done per token).
+Already in place: **MoE sparsity** (only the top-4 experts run per token) and the **KV +
+conv-state caches** (decode is O(n)). `benchmark.sh` greedily generates 8 tokens, reports
+prefill/decode tok/s, and checks the (deterministic) continuation against an expected
+string — use it to measure each optimization below.
 
 Ordered easiest → hardest, with rough impact. Effects are roughly **multiplicative**
 (threads × SIMD-lanes × cache), so the combined ceiling is large (~10–30× over baseline).
@@ -427,13 +430,49 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | # | Optimization | Effort | Rough impact |
 |---|---|---|---|
 | **9a** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul; skip it for the other prefill tokens. | trivial | prefill only: ~10–15% per skipped prompt token; no decode effect |
-| **9b** | **Precompute small F32 tensors at load** (norm gains, conv filters, router biases) and cut per-step `Vec` allocations / repeated dequant. | easy | small, ~5%; removes allocation churn |
+| **9b** | **Precompute small F32 tensors at load** — dequantize all the F32 1-D tensors once into `Model` (≈101 re-dequantized per token today; ~6.3 MB total) and cut per-step `Vec` allocations. See notes for the exact list. | easy | small, ~5%; removes ~101 allocs/token |
 | **9c** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). | easy | **HIGH ≈ core count** (≈4–8× here) |
-| **9d** | **Cross-platform SIMD for dot + dequant MAC** — use the **`wide`** crate (`f32x8`; stable, pure-Rust, compiles to SSE/AVX2/NEON). Favor this over `std::arch` intrinsics; `std::simd` is equivalent but nightly-only. | moderate | ~2–4× on `matvec` compute; multiplies with 9c |
+| **9d** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | ~2–4× on `matvec`; multiplies with 9c |
 | **9e** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | ~1.3–2×; combines with 9d |
 | **9f** | **Batched GEMM prefill** — dequantize each weight row once and apply to all prompt tokens at once (vs. once per token). | moderate | prefill only: ≈ prompt-length×; no decode effect |
 | **9g** | **f16 KV cache** — store K/V as f16 to halve attention memory bandwidth. | easy–moderate | small now; grows with context length |
-| **9h** | **Q8 activation + integer block dot** (llama.cpp `vec_dot` style) — quantize the activation to Q8 and dot directly against Q4_K/Q6_K quants, skipping full f32 dequant. The main algorithmic CPU trick; supersedes 9d/9e on the hot path. | hard | **HIGH ~2–4×**, but most complex |
+| **9h** | **Q8 activation + integer block dot** (llama.cpp `vec_dot`) — *per-matmul*, quantize the **input vector** to Q8_K (activations stay f32 everywhere else) and dot in the integer domain directly against the Q4_K/Q6_K quants; no f32 weight dequant. Supersedes 9d/9e on the hot path. See notes. | hard | **HIGH ~2–4×**, most complex |
 
 Suggested order: **9a, 9b** (quick), then **9c** (biggest single win), then **9d/9e**
 (SIMD + fusion). 9f for long prompts, 9g for long contexts, 9h last (largest rewrite).
+
+### Notes on selected sub-items
+
+**9b — exact F32 tensors to precompute.** These are re-dequantized via `dequant_vec` on
+every `forward_step` (~101 small heap allocations + copies per token). Dequantize each
+once at load into `Model` (indexed by layer) — ~6.3 MB total (the whole F32 footprint):
+
+| Tensor | shape | count |
+|---|---|---|
+| `blk.{i}.attn_norm.weight` (operator pre-norm gain) | F32 [2048] | 24 |
+| `blk.{i}.ffn_norm.weight` (FFN pre-norm gain) | F32 [2048] | 24 |
+| `blk.{i}.attn_q_norm.weight` / `attn_k_norm.weight` | F32 [64] | 6 + 6 |
+| `blk.{i}.shortconv.conv.weight` (depthwise filter) | F32 [3×2048] | 18 |
+| `blk.{i}.exp_probs_b.bias` (expert bias) | F32 [32] | 22 |
+| `token_embd_norm.weight` (final norm gain) | F32 [2048] | 1 |
+
+The F32 *router* matrices `ffn_gate_inp.weight` `[2048×32]` go through `matvec` (not
+`dequant_vec`), so they're separate and lower priority.
+
+**9d — SIMD width.** AVX2 is 256-bit = **8×f32**, so `f32x8` is the correct width (one
+YMM register); on arm64 NEON (128-bit = 4×f32) it lowers to 2× `f32x4`. `f32x16` would be
+AVX-512 (512-bit) — not present on this machine and not provided by `wide`. To exceed
+8-wide throughput, use **multiple independent `f32x8` accumulators** to hide FMA latency,
+not wider lanes.
+
+**9h — what it implies.** *Not* a global switch to Q8 activations; the residual stream,
+norms, attention, etc. stay f32. Per matmul: (1) quantize just the input vector `x` to
+**Q8_K** (256-value blocks, int8 + scale + per-16 sums) — a cheap one-pass step; (2)
+compute the dot in the integer domain against the weight's packed quants (Q4_K nibbles /
+Q6_K 6-bit), accumulating int32, then scale by `weight_scale × activation_scale` per
+block (plus Q4_K's `min` term). I.e. `vec_dot_q4_K_q8_K` / `vec_dot_q6_K_q8_K`. Benefits:
+no f32 weight materialization, compact weight traffic, fast int8 dot. Caveats: it
+**replaces** (not stacks with) 9d/9e on the hot path; peak int8-dot throughput relies on
+**VNNI** (x86) / **dotprod** (NEON) instructions that `wide`/`std::simd` don't expose, so
+a fully portable version gets the algorithmic win but maybe not the absolute peak without
+`std::arch` — a slight tension with the cross-platform-SIMD preference.

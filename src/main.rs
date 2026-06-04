@@ -163,13 +163,25 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
         prompt.len()
     );
     let mut sampler = Sampler::greedy();
-    let generated = model.generate(&prompt, &mut sampler, max_new, tok.eos);
+    let (generated, stats) = model.generate_with_stats(&prompt, &mut sampler, max_new, tok.eos);
     let continuation = tok.decode(&generated);
 
     println!("prompt       : {text:?}");
     println!("continuation : {continuation:?}");
     println!("prompt ids   : {prompt:?}");
     println!("gen ids      : {generated:?}");
+    println!(
+        "prefill      : {} tok in {:.0} ms ({:.1} tok/s)",
+        stats.prompt_tokens,
+        stats.prefill.as_secs_f64() * 1e3,
+        stats.prefill_tps()
+    );
+    println!(
+        "decode       : {} tok in {:.0} ms ({:.2} tok/s)",
+        stats.generated_tokens,
+        stats.decode.as_secs_f64() * 1e3,
+        stats.decode_tps()
+    );
     Ok(())
 }
 
