@@ -381,7 +381,7 @@ src/
   model.rs           # ✓ weight loading + static forward pass (embed→layers→norm→logits)
   cache.rs           #   KV cache + conv-state cache
   sampler.rs         # ✓ temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
-  tokenizer.rs       #   byte-level BPE from GGUF metadata (next)
+  tokenizer.rs       # ✓ byte-level BPE from GGUF (hand-rolled lfm2 pretokenizer, no regex)
   kernels/
     mod.rs           # ✓
     dequant.rs ✓  matmul.rs ✓  rmsnorm.rs ✓  rope.rs ✓
@@ -405,17 +405,18 @@ src/
    `const`s + `validate(&gguf)`; `Model::load` resolves all 256 tensors by name and
    checks shapes. `bebelm load` confirmed it against the real file. (We chose a **static
    forward pass** — see note below — rather than runtime config interpretation.)
-5. **Remaining kernels + single forward pass** (no cache): `rope`, `softmax`,
-   `activation` (SiLU/SwiGLU), `elementwise`, `conv`, `attention`; wire the static layer
-   loop (embed → 24 layers → final norm → logits) incl. MoE routing. Validate logits
-   against a reference (throwaway HF `transformers` script) on a fixed token sequence.
+5. ✅ **Remaining kernels + single forward pass** (no cache): `rope`, `softmax`,
+   `activation` (SiLU/SwiGLU), `elementwise`, `conv`, `attention`; wired the static layer
+   loop (embed → 24 layers → final norm → logits) incl. MoE routing. (Correctness
+   confirmed end-to-end by the milestone-8 continuation test, not a logit-reference script.)
 6. **KV + conv-state caches**; multi-token prefill then incremental decode.
 7. ✅ **Sampling + generation** (`sampler.rs`, `Model::generate`): one sampler (temp +
    top-k, temp 0 = greedy, rep penalty), hand-rolled PRNG; autoregressive loop (no cache
    yet). `bebelm generate` works on raw token ids.
-8. **Tokenizer** (byte-level BPE from GGUF) + chat template → end-to-end text. **This is
-   our correctness gate** (replacing the logit-reference script): a known prompt like
-   "The capital of France is" must greedily continue with " Paris".
+8. ✅ **Tokenizer** (`tokenizer.rs`): byte-level BPE from the GGUF, hand-rolled lfm2
+   pre-tokenizer (no `regex`), GPT-2 byte↔char table, merges. Round-trips on the real
+   vocab. **Correctness gate PASSED:** `bebelm complete … "The capital of France is"` →
+   " the city of Paris" (fluent + factually correct), validating the whole pipeline.
 9. **Optimizations:** sparse-expert execution, rayon, SIMD, f16 KV cache.
   - TODO: break this down into sub-steps
 10. **Cleanup:** remove unused code and validation code that is no longer needed.
