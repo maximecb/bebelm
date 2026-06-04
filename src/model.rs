@@ -145,16 +145,18 @@ impl Model {
     /// Autoregressive generation with the KV + conv caches. Stops at `eos` or after
     /// `max_new` tokens. Returns the newly generated token ids (excluding the prompt).
     pub fn generate(&self, prompt: &[u32], sampler: &mut Sampler, max_new: usize, eos: u32) -> Vec<u32> {
-        self.generate_with_stats(prompt, sampler, max_new, eos).0
+        self.generate_with_stats(prompt, sampler, max_new, eos, |_| {}).0
     }
 
-    /// Like [`generate`](Self::generate) but also returns prefill/decode timing.
+    /// Like [`generate`](Self::generate) but also returns prefill/decode timing and calls
+    /// `on_token` with each token as it is produced (for streaming output).
     pub fn generate_with_stats(
         &self,
         prompt: &[u32],
         sampler: &mut Sampler,
         max_new: usize,
         eos: u32,
+        mut on_token: impl FnMut(u32),
     ) -> (Vec<u32>, GenStats) {
         let mut cache = Cache::new();
         let mut history = prompt.to_vec();
@@ -175,6 +177,7 @@ impl Model {
             let next = sampler.sample(&mut logits, &history);
             generated.push(next);
             history.push(next);
+            on_token(next);
             if next == eos {
                 break;
             }

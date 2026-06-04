@@ -17,7 +17,9 @@ set -euo pipefail
 MODEL="${1:-models/LFM2.5-8B-A1B-Q4_K_M.gguf}"
 PROMPT="The capital of France is"
 MAX_NEW=8
-EXPECTED=" the city of Paris. city of Paris"   # greedy, 8 tokens (keep in sync with PROMPT/MAX_NEW)
+# Expected greedy token ids (deterministic on single-core scalar f32). Robust to text
+# formatting; keep in sync with PROMPT/MAX_NEW. Decodes to " the city of Paris. city of Paris".
+EXPECTED_IDS="[278, 3270, 302, 4741, 22, 3270, 302, 4741]"
 
 if [ ! -f "$MODEL" ]; then
     echo "error: model not found: $MODEL" >&2
@@ -29,28 +31,34 @@ echo "building (release)..."
 cargo build --release --quiet
 
 echo "running: complete $MAX_NEW \"$PROMPT\""
-OUT="$(./target/release/bebelm complete "$MODEL" "$MAX_NEW" "$PROMPT")"
-echo "$OUT"
+echo
+# `tee` to a temp file so the generation streams to the terminal live (the per-token
+# flushes in `complete` make it appear token-by-token) while we still capture it to parse.
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+./target/release/bebelm complete "$MODEL" "$MAX_NEW" "$PROMPT" | tee "$TMP"
+OUT="$(cat "$TMP")"
 echo
 
-CONT="$(printf '%s\n' "$OUT" | sed -n 's/^continuation : "\(.*\)"$/\1/p')"
+CONT="$(printf '%s\n' "$OUT" | sed -n 's/^continuation : //p')"
+GEN_IDS="$(printf '%s\n' "$OUT" | sed -n 's/^gen ids *: //p')"
 PREFILL_TPS="$(printf '%s\n' "$OUT" | sed -n 's/^prefill .*(\(.*\) tok\/s)$/\1/p')"
 DECODE_TPS="$(printf '%s\n' "$OUT" | sed -n 's/^decode .*(\(.*\) tok\/s)$/\1/p')"
 
 echo "prefill throughput: ${PREFILL_TPS:-?} tok/s"
 echo "decode throughput:  ${DECODE_TPS:-?} tok/s"
 
-if [ "$CONT" = "$EXPECTED" ]; then
-    echo "PASS: output matches expected exactly"
+if [ "$GEN_IDS" = "$EXPECTED_IDS" ]; then
+    echo "PASS: generated ids match expected"
     exit 0
 elif printf '%s' "$CONT" | grep -q "Paris"; then
-    echo "WARN: exact mismatch, but output still mentions Paris (FP/impl drift?)"
-    echo "  expected: \"$EXPECTED\""
-    echo "  actual  : \"$CONT\""
+    echo "WARN: ids mismatch, but output still mentions Paris (FP/impl drift?)"
+    echo "  expected ids: $EXPECTED_IDS"
+    echo "  actual ids  : $GEN_IDS"
     exit 1
 else
     echo "FAIL: unexpected output"
-    echo "  expected: \"$EXPECTED\""
-    echo "  actual  : \"$CONT\""
+    echo "  expected ids: $EXPECTED_IDS"
+    echo "  actual ids  : $GEN_IDS"
     exit 1
 fi

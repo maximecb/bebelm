@@ -4,6 +4,7 @@
 //! kernels on a tensor (`dequant`), or load + validate the whole model (`load`).
 
 use std::error::Error;
+use std::io::Write;
 use std::process::ExitCode;
 
 use bebelm::config;
@@ -162,12 +163,18 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
         "prompt = {} tokens; greedy-generating up to {max_new} (cached, single-core)...",
         prompt.len()
     );
-    let mut sampler = Sampler::greedy();
-    let (generated, stats) = model.generate_with_stats(&prompt, &mut sampler, max_new, tok.eos);
-    let continuation = tok.decode(&generated);
-
     println!("prompt       : {text:?}");
-    println!("continuation : {continuation:?}");
+    print!("continuation : ");
+    std::io::stdout().flush().ok();
+
+    // Stream each token's text to stdout as it is generated.
+    let mut sampler = Sampler::greedy();
+    let (generated, stats) = model.generate_with_stats(&prompt, &mut sampler, max_new, tok.eos, |t| {
+        print!("{}", tok.decode(&[t]));
+        std::io::stdout().flush().ok();
+    });
+    println!(); // end the streamed line
+
     println!("prompt ids   : {prompt:?}");
     println!("gen ids      : {generated:?}");
     println!(
