@@ -12,7 +12,7 @@ use bebelm::gguf::{GgufFile, MetaValue};
 use bebelm::kernels::dequant;
 use bebelm::model::Model;
 use bebelm::sampler::Sampler;
-use bebelm::tokenizer::Tokenizer;
+use bebelm::tokenizer::{self, Tokenizer};
 
 type Cmd = Result<(), Box<dyn Error>>;
 
@@ -125,7 +125,7 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
     let model = Model::load(path)?;
     eprintln!("greedy-generating up to {max_new} token(s) (cached, multi-threaded)...");
     let mut sampler = Sampler::greedy();
-    let generated = model.generate(&prompt, &mut sampler, max_new, config::EOS_TOKEN);
+    let generated = model.generate(&prompt, &mut sampler, max_new, tokenizer::TOKEN_EOS);
 
     println!("prompt    : {prompt:?}");
     println!("generated : {generated:?}");

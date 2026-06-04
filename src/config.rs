@@ -31,8 +31,8 @@ pub const CONV_L_CACHE: usize = 3; // shortconv kernel size
 pub const ROPE_THETA: f32 = 5_000_000.0;
 pub const RMS_EPS: f32 = 1e-5;
 
-pub const BOS_TOKEN: u32 = 124_894;
-pub const EOS_TOKEN: u32 = 124_900;
+// Special/control token ids live with the tokenizer (see [`crate::tokenizer`]); they're a
+// vocab concern, not part of the forward-pass architecture defined here.
 
 /// 0-indexed layers using grouped-query attention; all others use the gated short conv.
 pub const ATTENTION_LAYERS: [usize; 6] = [2, 6, 10, 14, 18, 21];

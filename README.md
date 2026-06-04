@@ -6,5 +6,5 @@ Intentionally has very few dependencies and requires no extra system packages to
 
 This is a library crate so the model can be imported.
 
-In order to run, the weights GGUF file needs to be downloaded first (~6GB? exact size?).
+In order to run, the weights GGUF file needs to be downloaded first (5.2GB).
 

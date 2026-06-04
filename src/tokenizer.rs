@@ -10,11 +10,63 @@ use std::error::Error;
 
 use crate::gguf::GgufFile;
 
+/// `tokenizer.ggml.token_type` values for the atomic tokens (the GGUF/llama.cpp enum):
+/// CONTROL (e.g. `<|im_start|>`) and USER_DEFINED (e.g. `<think>`).
+const TOKEN_TYPE_CONTROL: u32 = 3;
+const TOKEN_TYPE_USER_DEFINED: u32 = 4;
+
+// --- Special / control token ids (CONTROL/USER_DEFINED entries in the GGUF vocab) ---
+//
+// The chat format is ChatML — `<|im_start|>{role}\n{content}<|im_end|>` wrapped in BOS — so
+// end-of-sequence is `<|im_end|>`, not `<|endoftext|>`. The shared vocab also carries
+// multimodal markers (`<image>`, a 10×10 `<|img_row_*|>` grid, audio/image/mixed start/end);
+// this text model never emits them, and `encode` recognizes every control token generically
+// from `token_type`, so only the text/chat/code/tool ids are named here.
+pub const TOKEN_PAD: u32 = 124_893; // <|pad|>
+pub const TOKEN_BOS: u32 = 124_894; // <|startoftext|>
+pub const TOKEN_ENDOFTEXT: u32 = 124_895; // <|endoftext|>
+pub const TOKEN_FIM_PRE: u32 = 124_896; // <|fim_pre|>  (fill-in-the-middle prefix)
+pub const TOKEN_FIM_MID: u32 = 124_897; // <|fim_mid|>
+pub const TOKEN_FIM_SUF: u32 = 124_898; // <|fim_suf|>
+pub const TOKEN_IM_START: u32 = 124_899; // <|im_start|>
+pub const TOKEN_IM_END: u32 = 124_900; // <|im_end|>  (also the EOS token)
+pub const TOKEN_EOS: u32 = TOKEN_IM_END;
+pub const TOKEN_THINK: u32 = 124_901; // <think>
+pub const TOKEN_THINK_END: u32 = 124_902; // </think>
+pub const TOKEN_TOOL_LIST_START: u32 = 124_903; // <|tool_list_start|>
+pub const TOKEN_TOOL_LIST_END: u32 = 124_904; // <|tool_list_end|>
+pub const TOKEN_TOOL_CALL_START: u32 = 124_905; // <|tool_call_start|>
+pub const TOKEN_TOOL_CALL_END: u32 = 124_906; // <|tool_call_end|>
+
+/// The named control tokens paired with their literal vocab strings. Used to validate a
+/// loaded GGUF against these hardcoded ids — the file stays the source of truth at runtime,
+/// this just fails loudly on a mismatched/updated vocab.
+pub const SPECIAL_TOKENS: &[(&str, u32)] = &[
+    ("<|pad|>", TOKEN_PAD),
+    ("<|startoftext|>", TOKEN_BOS),
+    ("<|endoftext|>", TOKEN_ENDOFTEXT),
+    ("<|fim_pre|>", TOKEN_FIM_PRE),
+    ("<|fim_mid|>", TOKEN_FIM_MID),
+    ("<|fim_suf|>", TOKEN_FIM_SUF),
+    ("<|im_start|>", TOKEN_IM_START),
+    ("<|im_end|>", TOKEN_IM_END),
+    ("<think>", TOKEN_THINK),
+    ("</think>", TOKEN_THINK_END),
+    ("<|tool_list_start|>", TOKEN_TOOL_LIST_START),
+    ("<|tool_list_end|>", TOKEN_TOOL_LIST_END),
+    ("<|tool_call_start|>", TOKEN_TOOL_CALL_START),
+    ("<|tool_call_end|>", TOKEN_TOOL_CALL_END),
+];
+
 pub struct Tokenizer {
     id_to_token: Vec<String>,
     token_to_id: HashMap<String, u32>,
     /// (left, right) byte-char symbol pair → merge rank (lower = merged first).
     merge_rank: HashMap<(String, String), u32>,
+    /// Control/user-defined tokens (`<|im_start|>`, `<think>`, …) as `(literal, id)`, longest
+    /// literal first. These are atomic: `encode` emits the id directly instead of BPE-ing the
+    /// literal text. See [`crate::config::SPECIAL_TOKENS`].
+    specials: Vec<(String, u32)>,
     byte_encoder: [char; 256],
     byte_decoder: HashMap<char, u8>,
     pub bos: u32,
@@ -49,25 +101,74 @@ impl Tokenizer {
             }
         }
 
+        // Validate the named control tokens against the file before trusting their ids.
+        for &(lit, id) in SPECIAL_TOKENS {
+            let got = id_to_token.get(id as usize).map(String::as_str);
+            if got != Some(lit) {
+                return Err(format!("special token id {id}: expected {lit:?}, got {got:?}").into());
+            }
+        }
+
+        // Every control/user-defined token is atomic on encode. Collect them all (not just the
+        // named ones) from `token_type`, longest literal first so the longest match wins.
+        let mut specials: Vec<(String, u32)> = match g.get_u32_array("tokenizer.ggml.token_type") {
+            Some(types) => types
+                .iter()
+                .enumerate()
+                .filter(|&(_, &ty)| ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED)
+                .filter_map(|(id, _)| id_to_token.get(id).map(|t| (t.clone(), id as u32)))
+                .collect(),
+            None => Vec::new(),
+        };
+        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
         let byte_encoder = byte_to_unicode();
         let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
 
-        let bos = g.get_u32("tokenizer.ggml.bos_token_id").unwrap_or(crate::config::BOS_TOKEN);
-        let eos = g.get_u32("tokenizer.ggml.eos_token_id").unwrap_or(crate::config::EOS_TOKEN);
+        let bos = g.get_u32("tokenizer.ggml.bos_token_id").unwrap_or(TOKEN_BOS);
+        let eos = g.get_u32("tokenizer.ggml.eos_token_id").unwrap_or(TOKEN_EOS);
 
-        Ok(Tokenizer { id_to_token, token_to_id, merge_rank, byte_encoder, byte_decoder, bos, eos })
+        Ok(Tokenizer { id_to_token, token_to_id, merge_rank, specials, byte_encoder, byte_decoder, bos, eos })
     }
 
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
     }
 
-    /// Encode text to token ids, optionally prepending BOS.
+    /// Encode text to token ids, optionally prepending BOS. Any special-token literal in `text`
+    /// (e.g. `<|im_start|>`) is emitted as its single id; the spans between them go through
+    /// byte-level BPE. This lets a ChatML-formatted prompt tokenize correctly.
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
         let mut ids = Vec::new();
         if add_bos {
             ids.push(self.bos);
         }
+        let mut rest = text;
+        while !rest.is_empty() {
+            // The earliest special-token occurrence in `rest` (ties broken toward the longest,
+            // which `specials` is ordered to favor); BPE everything before it.
+            let hit = self
+                .specials
+                .iter()
+                .filter_map(|(s, id)| rest.find(s.as_str()).map(|pos| (pos, s.len(), *id)))
+                .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            match hit {
+                Some((pos, len, id)) => {
+                    self.bpe_chunk(&rest[..pos], &mut ids);
+                    ids.push(id);
+                    rest = &rest[pos + len..];
+                }
+                None => {
+                    self.bpe_chunk(rest, &mut ids);
+                    break;
+                }
+            }
+        }
+        ids
+    }
+
+    /// Byte-level BPE-encode a span known to contain no special tokens, appending ids.
+    fn bpe_chunk(&self, text: &str, ids: &mut Vec<u32>) {
         for piece in pretokenize(text) {
             // byte-level: each UTF-8 byte of the piece maps to a visible char.
             let mapped: String = piece.bytes().map(|b| self.byte_encoder[b as usize]).collect();
@@ -84,7 +185,6 @@ impl Tokenizer {
                 }
             }
         }
-        ids
     }
 
     /// Decode token ids back to text (special/control tokens with non-byte chars are dropped).
@@ -311,5 +411,44 @@ mod tests {
         assert_eq!(pt("1234"), ["123", "4"]); // \p{N}{1,3}
         assert_eq!(pt("hello!"), ["hello", "!"]);
         assert_eq!(pt("a, b"), ["a", ",", " b"]);
+    }
+
+    /// A minimal tokenizer with no merges, a byte-char vocab (id == byte value), and two
+    /// special tokens — enough to exercise `encode`'s special-token splitting.
+    fn toy() -> Tokenizer {
+        let byte_encoder = byte_to_unicode();
+        let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
+        let mut token_to_id = std::collections::HashMap::new();
+        for b in 0u32..256 {
+            token_to_id.insert(byte_encoder[b as usize].to_string(), b);
+        }
+        Tokenizer {
+            id_to_token: Vec::new(),
+            token_to_id,
+            merge_rank: std::collections::HashMap::new(),
+            specials: vec![("<|im_start|>".to_string(), 1000), ("<|im_end|>".to_string(), 1001)],
+            byte_encoder,
+            byte_decoder,
+            bos: 2,
+            eos: 1001,
+        }
+    }
+
+    #[test]
+    fn encode_emits_special_token_ids() {
+        // Specials become a single id; the text around them is byte-encoded (id == byte).
+        let ids = toy().encode("hi<|im_start|>x<|im_end|>", false);
+        assert_eq!(ids, [b'h' as u32, b'i' as u32, 1000, b'x' as u32, 1001]);
+    }
+
+    #[test]
+    fn encode_adjacent_specials_have_no_gap() {
+        assert_eq!(toy().encode("<|im_start|><|im_end|>", false), [1000, 1001]);
+    }
+
+    #[test]
+    fn encode_plaintext_has_no_special_ids() {
+        let ids = toy().encode("hello", false);
+        assert_eq!(ids, "hello".bytes().map(u32::from).collect::<Vec<_>>());
     }
 }
