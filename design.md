@@ -385,7 +385,7 @@ src/
   kernels/
     mod.rs           # ✓
     dequant.rs ✓  matmul.rs ✓  rmsnorm.rs ✓  rope.rs
-    softmax.rs  attention.rs  conv.rs  activation.rs  elementwise.rs
+    softmax.rs ✓  attention.rs  conv.rs  activation.rs ✓  elementwise.rs ✓
 ```
 
 ---
