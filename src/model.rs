@@ -43,10 +43,12 @@ impl GenStats {
     }
 }
 
-/// A loaded, validated model: the mmapped GGUF plus a name → tensor index.
+/// A loaded, validated model: the mmapped GGUF plus a name → tensor index, plus the small
+/// F32 tensors (norm gains, conv filters, expert biases) pre-dequantized once (9b).
 pub struct Model {
     gguf: GgufFile,
     by_name: HashMap<String, usize>,
+    f32_cache: HashMap<String, Vec<f32>>,
 }
 
 impl Model {
@@ -60,9 +62,36 @@ impl Model {
             .enumerate()
             .map(|(i, t)| (t.name.clone(), i))
             .collect();
-        let model = Model { gguf, by_name };
+        let mut model = Model { gguf, by_name, f32_cache: HashMap::new() };
         model.check_tensors()?;
+        model.precompute_f32();
         Ok(model)
+    }
+
+    /// Pre-dequantize the small F32 tensors used per-token (norms, q/k norms, conv filters,
+    /// expert biases, final norm). The F32 router (`ffn_gate_inp`) is excluded — it goes
+    /// through `matvec` on its raw bytes, not [`f32`](Self::f32).
+    fn precompute_f32(&mut self) {
+        let mut cache = HashMap::new();
+        for t in &self.gguf.tensors {
+            if t.ggml_type == GgmlType::F32 && !t.name.ends_with("ffn_gate_inp.weight") {
+                let v = crate::kernels::dequant::dequantize(
+                    t.ggml_type,
+                    self.gguf.tensor_data(t),
+                    t.n_elements() as usize,
+                );
+                cache.insert(t.name.clone(), v);
+            }
+        }
+        self.f32_cache = cache;
+    }
+
+    /// A pre-dequantized F32 tensor by name (see [`precompute_f32`](Self::precompute_f32)).
+    fn f32(&self, name: &str) -> &[f32] {
+        self.f32_cache
+            .get(name)
+            .unwrap_or_else(|| panic!("f32 tensor not precomputed: {name}"))
+            .as_slice()
     }
 
     /// Look up a tensor's metadata by name.
@@ -133,9 +162,9 @@ impl Model {
 
     /// Final RMSNorm + tied logits (`token_embd · h`) for a hidden state.
     fn logits_from_hidden(&self, h: &[f32]) -> Vec<f32> {
-        let gain = self.dequant_vec("token_embd_norm.weight");
+        let gain = self.f32("token_embd_norm.weight");
         let mut normed = vec![0.0f32; HIDDEN];
-        rmsnorm(h, &gain, RMS_EPS, &mut normed);
+        rmsnorm(h, gain, RMS_EPS, &mut normed);
         let tok_embd = self.tensor("token_embd.weight").expect("token_embd");
         let mut logits = vec![0.0f32; VOCAB];
         matvec(tok_embd.ggml_type, self.data(tok_embd), HIDDEN, VOCAB, &normed, &mut logits);
@@ -216,9 +245,9 @@ impl Model {
             *bxc = bcx[c] * bcx[2 * HIDDEN + c];
         }
 
-        let conv_w = self.dequant_vec(&name(layer, "shortconv.conv.weight"));
+        let conv_w = self.f32(&name(layer, "shortconv.conv.weight"));
         let mut conv_out = vec![0.0f32; HIDDEN];
-        conv_step(&cache.conv[layer], &bx, &conv_w, HIDDEN, CONV_L_CACHE, &mut conv_out);
+        conv_step(&cache.conv[layer], &bx, conv_w, HIDDEN, CONV_L_CACHE, &mut conv_out);
 
         // Shift the conv state left one column and append the current Bx.
         let state = &mut cache.conv[layer];
@@ -244,10 +273,10 @@ impl Model {
         self.matvec1(&name(layer, "attn_k.weight"), x, HIDDEN, KV_DIM, &mut k);
         self.matvec1(&name(layer, "attn_v.weight"), x, HIDDEN, KV_DIM, &mut v);
 
-        let q_gain = self.dequant_vec(&name(layer, "attn_q_norm.weight"));
-        let k_gain = self.dequant_vec(&name(layer, "attn_k_norm.weight"));
-        norm_rope_heads(&mut q, N_HEADS, &q_gain, pos);
-        norm_rope_heads(&mut k, N_KV_HEADS, &k_gain, pos);
+        let q_gain = self.f32(&name(layer, "attn_q_norm.weight"));
+        let k_gain = self.f32(&name(layer, "attn_k_norm.weight"));
+        norm_rope_heads(&mut q, N_HEADS, q_gain, pos);
+        norm_rope_heads(&mut k, N_KV_HEADS, k_gain, pos);
 
         cache.k[layer].extend_from_slice(&k);
         cache.v[layer].extend_from_slice(&v);
@@ -278,7 +307,7 @@ impl Model {
     /// selected **sigmoid** scores, weighted sum of the 4 experts' SwiGLU MLPs.
     fn moe_ffn(&self, layer: usize, x: &[f32]) -> Vec<f32> {
         let router = self.tensor(&name(layer, "ffn_gate_inp.weight")).expect("router");
-        let bias = self.dequant_vec(&name(layer, "exp_probs_b.bias"));
+        let bias = self.f32(&name(layer, "exp_probs_b.bias"));
         let gate_exps = self.tensor(&name(layer, "ffn_gate_exps.weight")).expect("gate_exps");
         let up_exps = self.tensor(&name(layer, "ffn_up_exps.weight")).expect("up_exps");
         let down_exps = self.tensor(&name(layer, "ffn_down_exps.weight")).expect("down_exps");
@@ -326,16 +355,10 @@ impl Model {
 
     /// RMSNorm one `HIDDEN` vector with the named F32 gain.
     fn norm_one(&self, h: &[f32], gain_name: &str) -> Vec<f32> {
-        let gain = self.dequant_vec(gain_name);
+        let gain = self.f32(gain_name);
         let mut out = vec![0.0f32; HIDDEN];
-        rmsnorm(h, &gain, RMS_EPS, &mut out);
+        rmsnorm(h, gain, RMS_EPS, &mut out);
         out
-    }
-
-    /// Fully dequantize a (usually small, F32) tensor by name into a `Vec<f32>`.
-    fn dequant_vec(&self, tensor: &str) -> Vec<f32> {
-        let t = self.tensor(tensor).expect("dequant_vec: tensor");
-        crate::kernels::dequant::dequantize(t.ggml_type, self.data(t), t.n_elements() as usize)
     }
 
     /// Verify every tensor the forward pass will need exists with the expected shape.

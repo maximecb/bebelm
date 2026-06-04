@@ -430,7 +430,7 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | # | Optimization | Effort | Rough impact |
 |---|---|---|---|
 | **9a ✅** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul (`run_layers` vs `forward_step`); skip it for the rest. | trivial | **measured ~13% faster prefill** (0.8→0.9 tok/s, 6-tok prompt); no decode effect |
-| **9b** | **Precompute small F32 tensors at load** — dequantize all the F32 1-D tensors once into `Model` (≈101 re-dequantized per token today; ~6.3 MB total) and cut per-step `Vec` allocations. See notes for the exact list. | easy | small, ~5%; removes ~101 allocs/token |
+| **9b ✅** | **Precompute small F32 tensors at load** — dequantize the F32 norm/conv/bias tensors once into `Model` (~0.85 MB; router excluded) and read via `f32()`; removed `dequant_vec` + ~101 allocs/token. See notes. | easy | **measured: within noise** — F32 work is dwarfed by the matmuls; cleaner code, no speed change |
 | **9c** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). | easy | **HIGH ≈ core count** (≈4–8× here) |
 | **9d** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | ~2–4× on `matvec`; multiplies with 9c |
 | **9e** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | ~1.3–2×; combines with 9d |
@@ -443,9 +443,11 @@ Suggested order: **9a, 9b** (quick), then **9c** (biggest single win), then **9d
 
 ### Notes on selected sub-items
 
-**9b — exact F32 tensors to precompute.** These are re-dequantized via `dequant_vec` on
-every `forward_step` (~101 small heap allocations + copies per token). Dequantize each
-once at load into `Model` (indexed by layer) — ~6.3 MB total (the whole F32 footprint):
+**9b — exact F32 tensors to precompute.** These were re-dequantized via `dequant_vec` on
+every `forward_step` (~101 small heap allocations + copies per token). Pre-dequantized once
+at load into `Model.f32_cache` (~0.85 MB). The F32 **router** (`ffn_gate_inp`, ~5.8 MB —
+the bulk of the F32 footprint) is *excluded*: it goes through `matvec` on raw bytes, not
+`f32()`. The precomputed set:
 
 | Tensor | shape | count |
 |---|---|---|
