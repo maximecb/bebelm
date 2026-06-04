@@ -25,11 +25,6 @@ impl Sampler {
         Self::new(0.0, 0, 1.0, 0)
     }
 
-    /// Liquid's recommended stochastic defaults.
-    pub fn recommended(seed: u64) -> Self {
-        Self::new(0.2, 80, 1.05, seed)
-    }
-
     /// Pick the next token id from `logits` (mutated in place by the penalty/temperature).
     /// `history` is the tokens generated/seen so far (for the repetition penalty).
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
