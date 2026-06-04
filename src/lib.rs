@@ -7,4 +7,5 @@ pub mod config;
 pub mod gguf;
 pub mod kernels;
 pub mod model;
+pub mod sampler;
 pub mod tensor;

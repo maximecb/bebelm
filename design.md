@@ -378,10 +378,10 @@ src/
   gguf.rs            # ✓ GGUF parser + mmap-backed tensor table
   tensor.rs          # ✓ dtype enum + block sizing
   config.rs          # ✓ hardcoded architecture consts + validate(&gguf)
-  model.rs           # ◐ weight loading by name + shape check (forward pass next)
+  model.rs           # ✓ weight loading + static forward pass (embed→layers→norm→logits)
   cache.rs           #   KV cache + conv-state cache
-  sampler.rs         #   temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
-  tokenizer.rs       #   (phase 2) byte-level BPE from GGUF metadata
+  sampler.rs         # ✓ temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
+  tokenizer.rs       #   byte-level BPE from GGUF metadata (next)
   kernels/
     mod.rs           # ✓
     dequant.rs ✓  matmul.rs ✓  rmsnorm.rs ✓  rope.rs ✓
@@ -410,9 +410,12 @@ src/
    loop (embed → 24 layers → final norm → logits) incl. MoE routing. Validate logits
    against a reference (throwaway HF `transformers` script) on a fixed token sequence.
 6. **KV + conv-state caches**; multi-token prefill then incremental decode.
-7. **Sampling (temp + top-k, temp 0 = greedy) + generation** on raw token IDs; verify a
-   known continuation.
-8. **Tokenizer** (byte-level BPE from GGUF) + chat template → end-to-end text.
+7. ✅ **Sampling + generation** (`sampler.rs`, `Model::generate`): one sampler (temp +
+   top-k, temp 0 = greedy, rep penalty), hand-rolled PRNG; autoregressive loop (no cache
+   yet). `bebelm generate` works on raw token ids.
+8. **Tokenizer** (byte-level BPE from GGUF) + chat template → end-to-end text. **This is
+   our correctness gate** (replacing the logit-reference script): a known prompt like
+   "The capital of France is" must greedily continue with " Paris".
 9. **Optimizations:** sparse-expert execution, rayon, SIMD, f16 KV cache.
   - TODO: break this down into sub-steps
 10. **Cleanup:** remove unused code and validation code that is no longer needed.

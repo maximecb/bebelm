@@ -10,6 +10,7 @@ use bebelm::config;
 use bebelm::gguf::{GgufFile, MetaValue};
 use bebelm::kernels::dequant;
 use bebelm::model::Model;
+use bebelm::sampler::Sampler;
 
 type Cmd = Result<(), Box<dyn Error>>;
 
@@ -28,12 +29,22 @@ fn main() -> ExitCode {
             Some(path) => cmd_load(path),
             None => return usage("load <model.gguf>"),
         },
+        Some("logits") => match args.get(2) {
+            Some(path) => cmd_logits(path, &args[3..]),
+            None => return usage("logits <model.gguf> <token-id>..."),
+        },
+        Some("generate") => match (args.get(2), args.get(3)) {
+            (Some(path), Some(max)) => cmd_generate(path, max, &args[4..]),
+            _ => return usage("generate <model.gguf> <max-new-tokens> <token-id>..."),
+        },
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
-            eprintln!("  bebelm dump    <model.gguf>                 list metadata and tensors");
-            eprintln!("  bebelm dequant <model.gguf> <tensor-name>   dequantize a tensor, print stats");
-            eprintln!("  bebelm load    <model.gguf>                 load + validate against the config");
+            eprintln!("  bebelm dump     <model.gguf>                       list metadata and tensors");
+            eprintln!("  bebelm dequant  <model.gguf> <tensor-name>         dequantize a tensor, print stats");
+            eprintln!("  bebelm load     <model.gguf>                       load + validate against the config");
+            eprintln!("  bebelm logits   <model.gguf> <token-id>...         forward pass, print next-token logits");
+            eprintln!("  bebelm generate <model.gguf> <max-new> <token>...  greedy-generate token ids");
             return ExitCode::FAILURE;
         }
     };
@@ -71,6 +82,86 @@ fn cmd_load(path: &str) -> Cmd {
     println!("operators: attention at {attn:?}, gated short-conv elsewhere");
     println!("ffn      : dense at {dense:?}, sparse-MoE elsewhere");
     println!("all {} expected tensors present with correct shapes", bebelm::model::expected_tensors().len());
+    Ok(())
+}
+
+/// Parse a list of decimal token-id strings, bounds-checking against the vocab.
+fn parse_tokens(args: &[String]) -> Result<Vec<u32>, Box<dyn Error>> {
+    let mut tokens = Vec::with_capacity(args.len());
+    for s in args {
+        let id: u32 = s
+            .parse()
+            .map_err(|_| format!("invalid token id {s:?} (must be a non-negative integer)"))?;
+        if id as usize >= config::VOCAB {
+            return Err(format!("token id {id} out of range (vocab = {})", config::VOCAB).into());
+        }
+        tokens.push(id);
+    }
+    Ok(tokens)
+}
+
+/// Greedy-generate token ids from a prompt of token ids (text I/O arrives with the tokenizer).
+fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
+    let max_new: usize = max_str
+        .parse()
+        .map_err(|_| format!("invalid max-new-tokens {max_str:?}"))?;
+    let prompt = parse_tokens(token_args)?;
+    if prompt.is_empty() {
+        return Err("need at least one prompt token id".into());
+    }
+
+    let model = Model::load(path)?;
+    eprintln!("greedy-generating up to {max_new} token(s) (no cache, single-core; slow)...");
+    let mut sampler = Sampler::greedy();
+    let generated = model.generate(&prompt, &mut sampler, max_new, config::EOS_TOKEN);
+
+    println!("prompt    : {prompt:?}");
+    println!("generated : {generated:?}");
+    Ok(())
+}
+
+/// Run the forward pass on raw token ids and print the next-token logit summary.
+fn cmd_logits(path: &str, token_args: &[String]) -> Cmd {
+    let tokens = parse_tokens(token_args)?;
+    if tokens.is_empty() {
+        return Err("need at least one token id".into());
+    }
+
+    let model = Model::load(path)?;
+    eprintln!(
+        "running forward pass on {} token(s) (unoptimized, single-core; may take a while)...",
+        tokens.len()
+    );
+    let logits = model.forward(&tokens);
+
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut nonfinite = 0usize;
+    for &v in &logits {
+        if v.is_finite() {
+            min = min.min(v);
+            max = max.max(v);
+            sum += v as f64;
+        } else {
+            nonfinite += 1;
+        }
+    }
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+
+    println!("tokens    : {tokens:?}");
+    println!("logits    : {} (vocab)", logits.len());
+    println!("min/max   : {min:.4} / {max:.4}");
+    println!("mean      : {:.4}", sum / logits.len() as f64);
+    if nonfinite > 0 {
+        println!("non-finite: {nonfinite}  (BUG — expected 0)");
+    }
+    println!("argmax    : token {} (logit {:.4})", idx[0], logits[idx[0]]);
+    println!("top-5:");
+    for &i in idx.iter().take(5) {
+        println!("  token {i:>6}  logit {:.4}", logits[i]);
+    }
     Ok(())
 }
 
