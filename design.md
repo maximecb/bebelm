@@ -429,7 +429,7 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 
 | # | Optimization | Effort | Rough impact |
 |---|---|---|---|
-| **9a** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul; skip it for the other prefill tokens. | trivial | prefill only: ~10–15% per skipped prompt token; no decode effect |
+| **9a ✅** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul (`run_layers` vs `forward_step`); skip it for the rest. | trivial | **measured ~13% faster prefill** (0.8→0.9 tok/s, 6-tok prompt); no decode effect |
 | **9b** | **Precompute small F32 tensors at load** — dequantize all the F32 1-D tensors once into `Model` (≈101 re-dequantized per token today; ~6.3 MB total) and cut per-step `Vec` allocations. See notes for the exact list. | easy | small, ~5%; removes ~101 allocs/token |
 | **9c** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). | easy | **HIGH ≈ core count** (≈4–8× here) |
 | **9d** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | ~2–4× on `matvec`; multiplies with 9c |

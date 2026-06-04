@@ -83,20 +83,28 @@ impl Model {
     // --- forward pass (single-token, cached) ---
 
     /// Run the prompt through the model and return the logits for the **last** position
-    /// (length [`VOCAB`]), using a fresh cache internally.
+    /// (length [`VOCAB`]), using a fresh cache internally. Intermediate tokens only update
+    /// the cache (their logits are skipped — 9a).
     pub fn forward(&self, tokens: &[u32]) -> Vec<f32> {
-        assert!(!tokens.is_empty(), "forward: empty token sequence");
+        let (last, rest) = tokens.split_last().expect("forward: empty token sequence");
         let mut cache = Cache::new();
-        let mut logits = Vec::new();
-        for &tok in tokens {
-            logits = self.forward_step(tok, &mut cache);
+        for &tok in rest {
+            self.run_layers(tok, &mut cache);
         }
-        logits
+        self.forward_step(*last, &mut cache)
     }
 
-    /// Process one token at position `cache.pos`, update the KV + conv-state caches, and
-    /// return its next-token logits. One pass over the weights, plus O(context) attention.
+    /// Process one token at position `cache.pos`, update the caches, and return its
+    /// next-token logits. One pass over the weights, plus O(context) attention.
     pub fn forward_step(&self, token: u32, cache: &mut Cache) -> Vec<f32> {
+        let h = self.run_layers(token, cache);
+        self.logits_from_hidden(&h)
+    }
+
+    /// Embed + run the 24 decoder layers for one token (updating the KV/conv caches and
+    /// `cache.pos`), returning the final hidden state — *without* the logits projection.
+    /// Used for prefill tokens whose logits aren't needed (9a).
+    fn run_layers(&self, token: u32, cache: &mut Cache) -> Vec<f32> {
         let pos = cache.pos;
         let mut h = vec![0.0f32; HIDDEN];
         self.embed_token(token, &mut h);
@@ -119,14 +127,18 @@ impl Model {
             add_assign(&mut h, &ffn);
         }
 
+        cache.pos += 1;
+        h
+    }
+
+    /// Final RMSNorm + tied logits (`token_embd · h`) for a hidden state.
+    fn logits_from_hidden(&self, h: &[f32]) -> Vec<f32> {
         let gain = self.dequant_vec("token_embd_norm.weight");
         let mut normed = vec![0.0f32; HIDDEN];
-        rmsnorm(&h, &gain, RMS_EPS, &mut normed);
+        rmsnorm(h, &gain, RMS_EPS, &mut normed);
         let tok_embd = self.tensor("token_embd.weight").expect("token_embd");
         let mut logits = vec![0.0f32; VOCAB];
         matvec(tok_embd.ggml_type, self.data(tok_embd), HIDDEN, VOCAB, &normed, &mut logits);
-
-        cache.pos += 1;
         logits
     }
 
@@ -144,16 +156,16 @@ impl Model {
         max_new: usize,
         eos: u32,
     ) -> (Vec<u32>, GenStats) {
-        assert!(!prompt.is_empty(), "generate: empty prompt");
         let mut cache = Cache::new();
         let mut history = prompt.to_vec();
 
-        // Prefill: run every prompt token; the last one's logits predict the first new token.
+        // Prefill: only the last prompt token needs logits (9a); the rest just fill caches.
         let t_prefill = Instant::now();
-        let mut logits = Vec::new();
-        for &tok in prompt {
-            logits = self.forward_step(tok, &mut cache);
+        let (last, rest) = prompt.split_last().expect("generate: empty prompt");
+        for &tok in rest {
+            self.run_layers(tok, &mut cache);
         }
+        let mut logits = self.forward_step(*last, &mut cache);
         let prefill = t_prefill.elapsed();
 
         // Decode: sample, then compute the next logits (skip that on the final token).
