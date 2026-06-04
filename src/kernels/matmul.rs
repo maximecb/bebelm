@@ -120,6 +120,61 @@ fn dot_q4k_block(block: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+/// Over one 16-weight Q6_K sub-block, return `Σ (q_i − 32)·x_i` — the `−32` recentering
+/// folded into each lane. `ql`/`qh` are the current half's slices; `(ql_off, high, shift)`
+/// pick this group's `ql` nibble and `qh` 2-bit field (see [`dot_q6k_block`]); `l_start` is
+/// the sub-block's offset (0 or 16) into the half's 32-wide index `l`.
+#[inline]
+fn q6_dot16(ql: &[u8], qh: &[u8], ql_off: usize, high: bool, shift: u32, l_start: usize, x: &[f32]) -> f32 {
+    let mut qx = f32x8::splat(0.0);
+    for c in 0..2 {
+        let l = l_start + c * 8;
+        let mut q = [0.0f32; 8];
+        for (j, qj) in q.iter_mut().enumerate() {
+            let li = l + j;
+            let low = if high { (ql[ql_off + li] >> 4) as i32 } else { (ql[ql_off + li] & 0x0f) as i32 };
+            let hi = ((qh[li] >> shift) & 3) as i32;
+            *qj = ((low | (hi << 4)) - 32) as f32;
+        }
+        qx = f32x8::from(q).mul_add(load8(&x[c * 8..]), qx);
+    }
+    qx.reduce_add()
+}
+
+/// Fused dequantize-and-dot of one 210-byte Q6_K super-block against the matching 256
+/// activations `x`: returns `Σ_i w_i · x[i]` without materializing the weights.
+///
+/// `w = d · sc_sub · (q − 32)`, with one i8 `sc` per 16 weights and one f16 `d` per block,
+/// so `Σ w·x = d · Σ_sub sc_sub · Σ(q−32)·x` (block `d` factored out, applied once). Layout
+/// (see `dequant`'s module doc): `ql:u8[128]  qh:u8[64]  scales:i8[16]  d:f16`. Each
+/// 128-weight half splits into 4 groups of 32 (a low/high `ql` nibble + a 2-bit `qh` field),
+/// each group into two 16-weight sub-blocks — matching `dequant::dequantize_q6_k_block`.
+fn dot_q6k_block(block: &[u8], x: &[f32]) -> f32 {
+    // (ql byte offset within the half, take ql's high nibble?, qh bit shift) per group.
+    const GROUPS: [(usize, bool, u32); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];
+
+    let d = dequant::f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let sc_all = &block[192..208]; // i8 scales as raw bytes
+
+    let mut acc = 0.0f32; // Σ_sub sc·Σ(q−32)·x; scaled by the common block d once at the end
+    for n in 0..2 {
+        let ql = &ql_all[n * 64..n * 64 + 64];
+        let qh = &qh_all[n * 32..n * 32 + 32];
+        let sc = &sc_all[n * 8..n * 8 + 8];
+        let xh = &x[n * 128..]; // this half's 128 activations
+        for (g, &(ql_off, high, shift)) in GROUPS.iter().enumerate() {
+            let xg = &xh[g * 32..]; // this group's 32 activations
+            for sub in 0..2 {
+                let sc_s = sc[2 * g + sub] as i8 as f32;
+                acc += sc_s * q6_dot16(ql, qh, ql_off, high, shift, sub * 16, &xg[sub * 16..]);
+            }
+        }
+    }
+    d * acc
+}
+
 /// Compute `y = W·x`, where `W` is `[n_in, n_out]` quantized as `dtype` in `w`.
 ///
 /// `x.len() == n_in`, `y.len() == n_out`. Panics if `dtype` is unsupported or `n_in` is
@@ -134,25 +189,26 @@ pub fn matvec(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], y
     assert_eq!(n_in % blk_elems, 0, "matvec: n_in ({n_in}) not a multiple of block ({blk_elems})");
     let row_bytes = (n_in / blk_elems) * blk_bytes as usize;
 
-    // One output row. Q4_K (the bulk of the weights) is fused: each 256-weight block
-    // dequantizes straight into the dot, so it needs no scratch. Other dtypes dequantize
-    // the whole row into `scratch`, then dot.
+    // One output row. The K-quants (Q4_K/Q6_K — the bulk of the weights) are fused: each
+    // 256-weight block dequantizes straight into the dot, so they need no scratch. Other
+    // dtypes (F32/F16 — e.g. the MoE router) dequantize the whole row into `scratch`, then dot.
     let blk_bytes = blk_bytes as usize;
+    let fused = matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K);
     let compute_row = |o: usize, scratch: &mut [f32]| -> f32 {
         let row = &w[o * row_bytes..(o + 1) * row_bytes];
-        if dtype == GgmlType::Q4_K {
-            row.chunks_exact(blk_bytes)
-                .zip(x.chunks_exact(blk_elems))
-                .map(|(blk, xb)| dot_q4k_block(blk, xb))
-                .sum()
-        } else {
-            dequant::dequantize_into(dtype, row, scratch);
-            dot(scratch, x)
+        let blocks = || row.chunks_exact(blk_bytes).zip(x.chunks_exact(blk_elems));
+        match dtype {
+            GgmlType::Q4_K => blocks().map(|(blk, xb)| dot_q4k_block(blk, xb)).sum(),
+            GgmlType::Q6_K => blocks().map(|(blk, xb)| dot_q6k_block(blk, xb)).sum(),
+            _ => {
+                dequant::dequantize_into(dtype, row, scratch);
+                dot(scratch, x)
+            }
         }
     };
 
-    // Fused Q4_K rows ignore the scratch buffer, so don't allocate one for them.
-    let scratch_len = if dtype == GgmlType::Q4_K { 0 } else { n_in };
+    // Fused rows ignore the scratch buffer, so don't allocate one for them.
+    let scratch_len = if fused { 0 } else { n_in };
     if n_out < PAR_MIN_ROWS {
         let mut scratch = vec![0.0f32; scratch_len];
         for (o, yo) in y.iter_mut().enumerate() {
@@ -222,6 +278,31 @@ mod tests {
 
         let mut y = [0.0f32];
         matvec(GgmlType::Q4_K, &block, 256, 1, &x, &mut y);
+        assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {}", y[0], reference);
+    }
+
+    #[test]
+    fn matvec_q6k_fused_matches_dequant() {
+        // A non-trivial Q6_K block (varied scales incl. negatives, varied quants) dotted
+        // against varied x: the fused path must match dequantize-then-dot to f32 tolerance.
+        let mut block = vec![0u8; 210];
+        block[208..210].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
+        for (i, b) in block[0..128].iter_mut().enumerate() {
+            *b = (i * 53 + 17) as u8; // ql
+        }
+        for (i, b) in block[128..192].iter_mut().enumerate() {
+            *b = (i * 97 + 5) as u8; // qh
+        }
+        for (j, b) in block[192..208].iter_mut().enumerate() {
+            *b = (j.wrapping_mul(29).wrapping_add(3)) as u8; // i8 scales (some negative)
+        }
+        let x: Vec<f32> = (0..256).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+
+        let weights = dequant::dequantize(GgmlType::Q6_K, &block, 256);
+        let reference: f32 = weights.iter().zip(&x).map(|(&w, &xi)| w * xi).sum();
+
+        let mut y = [0.0f32];
+        matvec(GgmlType::Q6_K, &block, 256, 1, &x, &mut y);
         assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {}", y[0], reference);
     }
 
