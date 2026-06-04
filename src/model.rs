@@ -17,7 +17,7 @@ use crate::kernels::activation::{sigmoid_slice, swiglu};
 use crate::kernels::attention::attention_decode;
 use crate::kernels::conv::conv_step;
 use crate::kernels::elementwise::{add_assign, add_scaled};
-use crate::kernels::matmul::matvec;
+use crate::kernels::matmul::{matvec, matvec_fused_batch, FusedJob};
 use crate::kernels::rmsnorm::rmsnorm;
 use crate::kernels::rope::rope_neox;
 use crate::sampler::Sampler;
@@ -329,20 +329,51 @@ impl Model {
             *wi /= denom;
         }
 
+        // Gate + up for all selected experts in one parallel region (2·N_EXPERTS_USED fused
+        // matvecs sharing input `x`): gate rows first, then up rows. Each expert's matrix is
+        // small, so pooling their rows under a single fork/join keeps every core busy.
+        let gate_data = self.data(gate_exps);
+        let up_data = self.data(up_exps);
+        let mut jobs = Vec::with_capacity(2 * N_EXPERTS_USED);
+        for &e in sel {
+            let w = &gate_data[e * gate_stride..(e + 1) * gate_stride];
+            jobs.push(FusedJob { dtype: gate_exps.ggml_type, w, n_in: HIDDEN, n_out: MOE_FF, x });
+        }
+        for &e in sel {
+            let w = &up_data[e * up_stride..(e + 1) * up_stride];
+            jobs.push(FusedJob { dtype: up_exps.ggml_type, w, n_in: HIDDEN, n_out: MOE_FF, x });
+        }
+        let mut gate_up = vec![0.0f32; 2 * N_EXPERTS_USED * MOE_FF];
+        matvec_fused_batch(&jobs, &mut gate_up);
+        let (gate_all, up_all) = gate_up.split_at(N_EXPERTS_USED * MOE_FF);
+
+        // SwiGLU each expert's gate/up into its activation row.
+        let mut act_all = vec![0.0f32; N_EXPERTS_USED * MOE_FF];
+        for i in 0..N_EXPERTS_USED {
+            let r = i * MOE_FF..(i + 1) * MOE_FF;
+            swiglu(&gate_all[r.clone()], &up_all[r.clone()], &mut act_all[r]);
+        }
+
+        // Down projection for all experts in one parallel region (each consumes its own
+        // activation row), then weighted-sum the results in selection order (as before).
+        let down_data = self.data(down_exps);
+        let down_jobs: Vec<FusedJob> = sel
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| FusedJob {
+                dtype: down_exps.ggml_type,
+                w: &down_data[e * down_stride..(e + 1) * down_stride],
+                n_in: MOE_FF,
+                n_out: HIDDEN,
+                x: &act_all[i * MOE_FF..(i + 1) * MOE_FF],
+            })
+            .collect();
+        let mut down_all = vec![0.0f32; N_EXPERTS_USED * HIDDEN];
+        matvec_fused_batch(&down_jobs, &mut down_all);
+
         let mut out = vec![0.0f32; HIDDEN];
-        for (i, &e) in sel.iter().enumerate() {
-            let gate_w = &self.data(gate_exps)[e * gate_stride..(e + 1) * gate_stride];
-            let up_w = &self.data(up_exps)[e * up_stride..(e + 1) * up_stride];
-            let down_w = &self.data(down_exps)[e * down_stride..(e + 1) * down_stride];
-            let mut g = vec![0.0f32; MOE_FF];
-            let mut u = vec![0.0f32; MOE_FF];
-            matvec(gate_exps.ggml_type, gate_w, HIDDEN, MOE_FF, x, &mut g);
-            matvec(up_exps.ggml_type, up_w, HIDDEN, MOE_FF, x, &mut u);
-            let mut act = vec![0.0f32; MOE_FF];
-            swiglu(&g, &u, &mut act);
-            let mut down = vec![0.0f32; HIDDEN];
-            matvec(down_exps.ggml_type, down_w, MOE_FF, HIDDEN, &act, &mut down);
-            add_scaled(&mut out, &down, w[i]);
+        for i in 0..N_EXPERTS_USED {
+            add_scaled(&mut out, &down_all[i * HIDDEN..(i + 1) * HIDDEN], w[i]);
         }
         out
     }

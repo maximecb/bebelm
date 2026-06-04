@@ -175,6 +175,20 @@ fn dot_q6k_block(block: &[u8], x: &[f32]) -> f32 {
     d * acc
 }
 
+/// Dot one **fused** K-quant weight row (`row` = that output row's packed Q4_K/Q6_K bytes)
+/// with `x`, dequantizing each 256-weight block straight into the dot (no scratch). Panics
+/// for dtypes without a fused path. `row` and `x` must span the same whole number of blocks.
+#[inline]
+pub fn fused_row_dot(dtype: GgmlType, row: &[u8], x: &[f32]) -> f32 {
+    let (blk_elems, blk_bytes) = dtype.block().expect("fused dtype has a block size");
+    let blocks = || row.chunks_exact(blk_bytes as usize).zip(x.chunks_exact(blk_elems as usize));
+    match dtype {
+        GgmlType::Q4_K => blocks().map(|(blk, xb)| dot_q4k_block(blk, xb)).sum(),
+        GgmlType::Q6_K => blocks().map(|(blk, xb)| dot_q6k_block(blk, xb)).sum(),
+        other => panic!("fused_row_dot: {other} has no fused path"),
+    }
+}
+
 /// Compute `y = W·x`, where `W` is `[n_in, n_out]` quantized as `dtype` in `w`.
 ///
 /// `x.len() == n_in`, `y.len() == n_out`. Panics if `dtype` is unsupported or `n_in` is
@@ -192,18 +206,14 @@ pub fn matvec(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], y
     // One output row. The K-quants (Q4_K/Q6_K — the bulk of the weights) are fused: each
     // 256-weight block dequantizes straight into the dot, so they need no scratch. Other
     // dtypes (F32/F16 — e.g. the MoE router) dequantize the whole row into `scratch`, then dot.
-    let blk_bytes = blk_bytes as usize;
     let fused = matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K);
     let compute_row = |o: usize, scratch: &mut [f32]| -> f32 {
         let row = &w[o * row_bytes..(o + 1) * row_bytes];
-        let blocks = || row.chunks_exact(blk_bytes).zip(x.chunks_exact(blk_elems));
-        match dtype {
-            GgmlType::Q4_K => blocks().map(|(blk, xb)| dot_q4k_block(blk, xb)).sum(),
-            GgmlType::Q6_K => blocks().map(|(blk, xb)| dot_q6k_block(blk, xb)).sum(),
-            _ => {
-                dequant::dequantize_into(dtype, row, scratch);
-                dot(scratch, x)
-            }
+        if fused {
+            fused_row_dot(dtype, row, x)
+        } else {
+            dequant::dequantize_into(dtype, row, scratch);
+            dot(scratch, x)
         }
     };
 
@@ -221,6 +231,52 @@ pub fn matvec(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], y
             || vec![0.0f32; scratch_len],
             |scratch, (o, yo)| *yo = compute_row(o, scratch),
         );
+    }
+}
+
+/// One fused (Q4_K/Q6_K) matvec `y = W·x` for [`matvec_fused_batch`]: `w` is `n_out`
+/// contiguous weight rows of `n_in` weights each, dotted against `x` (`x.len() == n_in`).
+pub struct FusedJob<'a> {
+    pub dtype: GgmlType,
+    pub w: &'a [u8],
+    pub n_in: usize,
+    pub n_out: usize,
+    pub x: &'a [f32],
+}
+
+/// Run several fused matvecs as a **single** parallel region over all their output rows
+/// combined, writing job `j`'s `n_out` results into `out` at the running offset (so `out`
+/// must be `Σ n_out` long, jobs in order). Pooling the rows lets a few small matrices — e.g.
+/// the handful of selected MoE experts — saturate every core under one fork/join, instead of
+/// underutilizing it (and paying a join) one small matvec at a time. Each row is computed
+/// exactly as in [`matvec`], so results are identical to running the jobs separately.
+pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
+    // Per job: its row stride in bytes, and the first `out` row it owns (a prefix sum of
+    // n_out). `starts` is ascending, so a row's owning job is a binary search away.
+    let mut starts = Vec::with_capacity(jobs.len());
+    let mut row_bytes = Vec::with_capacity(jobs.len());
+    let mut total = 0usize;
+    for j in jobs {
+        let (blk_elems, blk_bytes) = j.dtype.block().expect("fused dtype has a block size");
+        assert_eq!(j.x.len(), j.n_in, "matvec_fused_batch: x length must equal n_in");
+        assert_eq!(j.n_in % blk_elems as usize, 0, "matvec_fused_batch: n_in not a block multiple");
+        starts.push(total);
+        row_bytes.push((j.n_in / blk_elems as usize) * blk_bytes as usize);
+        total += j.n_out;
+    }
+    assert_eq!(out.len(), total, "matvec_fused_batch: out length must equal Σ n_out");
+
+    let row = |gr: usize, o: &mut f32| {
+        // The owning job is the last `start` at or before this global row index.
+        let j = starts.partition_point(|&s| s <= gr) - 1;
+        let local = gr - starts[j];
+        let job = &jobs[j];
+        *o = fused_row_dot(job.dtype, &job.w[local * row_bytes[j]..(local + 1) * row_bytes[j]], job.x);
+    };
+    if total < PAR_MIN_ROWS {
+        out.iter_mut().enumerate().for_each(|(gr, o)| row(gr, o));
+    } else {
+        out.par_iter_mut().enumerate().for_each(|(gr, o)| row(gr, o));
     }
 }
 
