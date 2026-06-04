@@ -60,7 +60,7 @@ fn read_f16(bytes: &[u8], at: usize) -> f32 {
 /// Unpack the 6-bit sub-block scale `sc` and min `m` for sub-block `j` from the packed
 /// 12-byte `scales` array of a Q4_K block (ggml's `get_scale_min_k4`).
 #[inline]
-fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+pub(crate) fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     if j < 4 {
         (scales[j] & 63, scales[j + 4] & 63)
     } else {

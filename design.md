@@ -337,7 +337,7 @@ Pure Rust, no system packages. Each justified; minimal tree.
 
 > `half` was **dropped**: the file has no F16/BF16 whole tensors, so we only need f16→f32
 > for in-block scales — hand-rolled as a tested ~25-line `f16_to_f32` in
-> `kernels/dequant.rs`. Current dependency tree is just `memmap2` (+ `rayon` later).
+> `kernels/dequant.rs`. Current dependency tree: `memmap2`, `rayon`, `wide`.
 
 **Deliberately NOT taking crates for:**
 
@@ -407,10 +407,10 @@ src/
    " the city of Paris" (fluent + factually correct), validating the whole pipeline.
 9. **Optimizations** (sub-items 9a–9h in the *Optimizations* section above; ordered
    easiest-first with impact estimates). Baseline already has MoE sparsity + caches;
-   9a/9b/9c done (`rayon` row-parallel `matvec` landed the biggest win); suggested next:
-   9d/9e (`wide` SIMD + fusion). Cross-platform portable SIMD via the `wide` crate, not
-   `std::arch`.
-  - TODO: break this down into sub-steps
+   **9a–9e done**: `rayon` row-parallel `matvec` (9c) + `wide` `f32x8` SIMD dot fused with
+   per-block Q4_K dequant (9d/9e) now reach **~13.4 tok/s decode / ~15.2 prefill** (~15×
+   over the 0.87 single-core baseline). Suggested next: 9f (long prompts), 9g (long
+   contexts), 9h (int8 dot); also Q6_K `matvec` still uses the dequant-then-dot fallback.
   - llama.cpp has a custom GEMM (matrix multiply) and MoE routing kernels tuned for
     hybrid (convolution + attention) architecture. We could potentially take inspiration
     from this, but we should probably start by profiling our current kernels.
@@ -433,14 +433,15 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | **9a ✅** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul (`run_layers` vs `forward_step`); skip it for the rest. | trivial | **measured ~13% faster prefill** (0.8→0.9 tok/s, 6-tok prompt); no decode effect |
 | **9b ✅** | **Precompute small F32 tensors at load** — dequantize the F32 norm/conv/bias tensors once into `Model` (~0.85 MB; router excluded) and read via `f32()`; removed `dequant_vec` + ~101 allocs/token. See notes. | easy | **measured: within noise** — F32 work is dwarfed by the matmuls; cleaner code, no speed change |
 | **9c ✅** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). Serial fallback below 64 rows (router, k/v proj). | easy | **measured ~5.3× decode** (0.87→4.6 tok/s) + ~5–6× prefill on 10 cores (4P+6E); ids bit-identical |
-| **9d** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | ~2–4× on `matvec`; multiplies with 9c |
-| **9e** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | ~1.3–2×; combines with 9d |
+| **9d ✅** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | **measured ~1.75× decode** from the SIMD `dot` alone (4.75→8.31 tok/s); **~2.8× decode / 4.0× prefill** total once fused with 9e (→13.4 / 15.2 tok/s on 10 cores); ids still bit-identical |
+| **9e ✅** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | **done as part of 9d**: Q4_K rows dequantize each 256-weight block straight into the `f32x8` dot via `Σ(d·q−min)·x = d·Σ(q·x)−min·Σx` (scale/min applied once per sub-block). Folded into the 9d numbers. **Q6_K rows still use the dequant-row-then-dot fallback** — a follow-up |
 | **9f** | **Batched GEMM prefill** — dequantize each weight row once and apply to all prompt tokens at once (vs. once per token). | moderate | prefill only: ≈ prompt-length×; no decode effect |
 | **9g** | **f16 KV cache** — store K/V as f16 to halve attention memory bandwidth. | easy–moderate | small now; grows with context length |
 | **9h** | **Q8 activation + integer block dot** (llama.cpp `vec_dot`) — *per-matmul*, quantize the **input vector** to Q8_K (activations stay f32 everywhere else) and dot in the integer domain directly against the Q4_K/Q6_K quants; no f32 weight dequant. Supersedes 9d/9e on the hot path. See notes. | hard | **HIGH ~2–4×**, most complex |
 
 Suggested order: **9a, 9b** (quick), then **9c** (biggest single win), then **9d/9e**
-(SIMD + fusion). 9f for long prompts, 9g for long contexts, 9h last (largest rewrite).
+(SIMD + fusion) — **all done**. Remaining: 9f for long prompts, 9g for long contexts, 9h
+last (largest rewrite); plus Q6_K `matvec` fusion as a smaller follow-up.
 
 ### Notes on selected sub-items
 
