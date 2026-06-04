@@ -11,6 +11,7 @@ use bebelm::gguf::{GgufFile, MetaValue};
 use bebelm::kernels::dequant;
 use bebelm::model::Model;
 use bebelm::sampler::Sampler;
+use bebelm::tokenizer::Tokenizer;
 
 type Cmd = Result<(), Box<dyn Error>>;
 
@@ -37,6 +38,14 @@ fn main() -> ExitCode {
             (Some(path), Some(max)) => cmd_generate(path, max, &args[4..]),
             _ => return usage("generate <model.gguf> <max-new-tokens> <token-id>..."),
         },
+        Some("tokenize") => match args.get(2) {
+            Some(path) => cmd_tokenize(path, &args[3..]),
+            None => return usage("tokenize <model.gguf> <text>..."),
+        },
+        Some("complete") => match (args.get(2), args.get(3)) {
+            (Some(path), Some(max)) => cmd_complete(path, max, &args[4..]),
+            _ => return usage("complete <model.gguf> <max-new-tokens> <text>..."),
+        },
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
@@ -45,6 +54,8 @@ fn main() -> ExitCode {
             eprintln!("  bebelm load     <model.gguf>                       load + validate against the config");
             eprintln!("  bebelm logits   <model.gguf> <token-id>...         forward pass, print next-token logits");
             eprintln!("  bebelm generate <model.gguf> <max-new> <token>...  greedy-generate token ids");
+            eprintln!("  bebelm tokenize <model.gguf> <text>...             encode/decode round-trip");
+            eprintln!("  bebelm complete <model.gguf> <max-new> <text>...   greedy text completion");
             return ExitCode::FAILURE;
         }
     };
@@ -117,6 +128,48 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
 
     println!("prompt    : {prompt:?}");
     println!("generated : {generated:?}");
+    Ok(())
+}
+
+/// Encode text to token ids and decode back — a round-trip check on the real vocab.
+fn cmd_tokenize(path: &str, text_args: &[String]) -> Cmd {
+    let text = text_args.join(" ");
+    let g = GgufFile::open(path)?;
+    let tok = Tokenizer::from_gguf(&g)?;
+    let ids = tok.encode(&text, false);
+    let decoded = tok.decode(&ids);
+    println!("text       : {text:?}");
+    println!("ids        : {ids:?}");
+    println!("decoded    : {decoded:?}");
+    println!("round-trip : {}", if decoded == text { "OK" } else { "MISMATCH" });
+    Ok(())
+}
+
+/// Encode text, greedy-generate a continuation, and decode it back to text.
+fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
+    let max_new: usize = max_str
+        .parse()
+        .map_err(|_| format!("invalid max-new-tokens {max_str:?}"))?;
+    let text = text_args.join(" ");
+    if text.is_empty() {
+        return Err("need a prompt".into());
+    }
+
+    let model = Model::load(path)?;
+    let tok = Tokenizer::from_gguf(model.gguf())?;
+    let prompt = tok.encode(&text, true);
+    eprintln!(
+        "prompt = {} tokens; greedy-generating up to {max_new} (no cache, single-core; slow)...",
+        prompt.len()
+    );
+    let mut sampler = Sampler::greedy();
+    let generated = model.generate(&prompt, &mut sampler, max_new, tok.eos);
+    let continuation = tok.decode(&generated);
+
+    println!("prompt       : {text:?}");
+    println!("continuation : {continuation:?}");
+    println!("prompt ids   : {prompt:?}");
+    println!("gen ids      : {generated:?}");
     Ok(())
 }
 

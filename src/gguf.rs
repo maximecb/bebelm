@@ -233,6 +233,21 @@ impl GgufFile {
         Some(out)
     }
 
+    /// Read an array-valued metadata entry of strings (e.g. the tokenizer vocab/merges).
+    pub fn get_str_array(&self, key: &str) -> Option<Vec<String>> {
+        let MetaValue::Array { items, .. } = self.get(key)? else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for it in items {
+            match it {
+                MetaValue::String(s) => out.push(s.clone()),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         match self.get(key)? {
             MetaValue::F32(v) => Some(*v),

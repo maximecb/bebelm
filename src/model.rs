@@ -53,6 +53,11 @@ impl Model {
         self.gguf.tensor_data(t)
     }
 
+    /// The underlying GGUF (e.g. to build a [`crate::tokenizer::Tokenizer`] from the same mmap).
+    pub fn gguf(&self) -> &GgufFile {
+        &self.gguf
+    }
+
     // --- forward pass ---
 
     /// Run the prompt (token ids) through the model and return the logits for the **last**
