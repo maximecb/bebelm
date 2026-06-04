@@ -34,9 +34,11 @@ echo "$OUT"
 echo
 
 CONT="$(printf '%s\n' "$OUT" | sed -n 's/^continuation : "\(.*\)"$/\1/p')"
+PREFILL_TPS="$(printf '%s\n' "$OUT" | sed -n 's/^prefill .*(\(.*\) tok\/s)$/\1/p')"
 DECODE_TPS="$(printf '%s\n' "$OUT" | sed -n 's/^decode .*(\(.*\) tok\/s)$/\1/p')"
 
-echo "decode throughput: ${DECODE_TPS:-?} tok/s"
+echo "prefill throughput: ${PREFILL_TPS:-?} tok/s"
+echo "decode throughput:  ${DECODE_TPS:-?} tok/s"
 
 if [ "$CONT" = "$EXPECTED" ]; then
     echo "PASS: output matches expected exactly"
