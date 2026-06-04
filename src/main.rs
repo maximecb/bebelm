@@ -122,7 +122,7 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
     }
 
     let model = Model::load(path)?;
-    eprintln!("greedy-generating up to {max_new} token(s) (no cache, single-core; slow)...");
+    eprintln!("greedy-generating up to {max_new} token(s) (cached, single-core)...");
     let mut sampler = Sampler::greedy();
     let generated = model.generate(&prompt, &mut sampler, max_new, config::EOS_TOKEN);
 
@@ -159,7 +159,7 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
     let tok = Tokenizer::from_gguf(model.gguf())?;
     let prompt = tok.encode(&text, true);
     eprintln!(
-        "prompt = {} tokens; greedy-generating up to {max_new} (no cache, single-core; slow)...",
+        "prompt = {} tokens; greedy-generating up to {max_new} (cached, single-core)...",
         prompt.len()
     );
     let mut sampler = Sampler::greedy();

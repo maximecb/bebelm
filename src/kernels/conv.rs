@@ -48,6 +48,32 @@ pub fn causal_depthwise_conv(
     }
 }
 
+/// Single-token causal depthwise conv (decode step). `state` holds the previous
+/// `l_cache-1` columns of Bx (oldest first, `channels` each); `bx` is the current column.
+/// `out[c] = Σ_{k<l_cache-1} weight[c,k]·state[k,c] + weight[c,l_cache-1]·bx[c]`.
+pub fn conv_step(
+    state: &[f32],
+    bx: &[f32],
+    weight: &[f32],
+    channels: usize,
+    l_cache: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(state.len(), channels * (l_cache - 1));
+    debug_assert_eq!(bx.len(), channels);
+    debug_assert_eq!(out.len(), channels);
+    debug_assert_eq!(weight.len(), channels * l_cache);
+
+    for (c, o) in out.iter_mut().enumerate() {
+        let w = &weight[c * l_cache..c * l_cache + l_cache];
+        let mut sum = w[l_cache - 1] * bx[c];
+        for (k, &wk) in w.iter().take(l_cache - 1).enumerate() {
+            sum += wk * state[k * channels + c];
+        }
+        *o = sum;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +112,20 @@ mod tests {
         // out[0,c] = w[c][1]*bx[0,c] (only current tap): [2, 4]
         // out[1,c] = w[c][0]*bx[0,c] + w[c][1]*bx[1,c]: [1+2, 3+4] = [3, 7]
         assert_eq!(out, [2.0, 4.0, 3.0, 7.0]);
+    }
+
+    #[test]
+    fn conv_step_matches_full_seq_last_position() {
+        // Full-seq conv over [2,3,4] (1 channel, l_cache 3), weight [1,10,100].
+        let weight = [1.0f32, 10.0, 100.0];
+        let bx = [2.0f32, 3.0, 4.0];
+        let mut full = [0.0f32; 3];
+        causal_depthwise_conv(&bx, &weight, 3, 1, 3, &mut full);
+
+        // Decode step at the last position: state = previous 2 columns [2, 3], current [4].
+        let state = [2.0f32, 3.0];
+        let mut step = [0.0f32; 1];
+        conv_step(&state, &[4.0], &weight, 1, 3, &mut step);
+        assert_eq!(step[0], full[2]); // both = 1*2 + 10*3 + 100*4 = 432
     }
 }

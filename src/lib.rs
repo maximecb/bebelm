@@ -3,6 +3,7 @@
 //! Library surface: the GGUF loader, dtype/block sizing, and the compute kernels. The
 //! `bebelm` binary (`src/main.rs`) is a thin CLI over this crate.
 
+pub mod cache;
 pub mod config;
 pub mod gguf;
 pub mod kernels;

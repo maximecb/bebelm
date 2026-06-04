@@ -27,38 +27,67 @@ pub fn attention(
 ) {
     debug_assert_eq!(q.len(), seq_len * n_heads * head_dim);
     debug_assert_eq!(k.len(), seq_len * n_kv_heads * head_dim);
-    debug_assert_eq!(v.len(), seq_len * n_kv_heads * head_dim);
     debug_assert_eq!(out.len(), seq_len * n_heads * head_dim);
+
+    // Each query position t attends to keys 0..=t — i.e. a decode step against the first
+    // t+1 cached positions.
+    let qrow = n_heads * head_dim;
+    let kvrow = n_kv_heads * head_dim;
+    for t in 0..seq_len {
+        let n_ctx = t + 1;
+        attention_decode(
+            &q[t * qrow..(t + 1) * qrow],
+            &k[..n_ctx * kvrow],
+            &v[..n_ctx * kvrow],
+            n_ctx,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            &mut out[t * qrow..(t + 1) * qrow],
+        );
+    }
+}
+
+/// Single-query attention: one query (`q`, `n_heads × head_dim`) attends to a cached
+/// history of `n_ctx` key/value positions (`k`/`v`, `n_ctx × n_kv_heads × head_dim`).
+/// Writes `out` (`n_heads × head_dim`). This is the decode-step core; the query is the
+/// latest position, so it attends to all `n_ctx` keys (no extra mask needed).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_ctx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(k.len(), n_ctx * n_kv_heads * head_dim);
+    debug_assert_eq!(v.len(), n_ctx * n_kv_heads * head_dim);
+    debug_assert_eq!(out.len(), n_heads * head_dim);
     debug_assert_eq!(n_heads % n_kv_heads, 0);
 
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let group = n_heads / n_kv_heads; // query heads per kv head
-    let mut scores = vec![0.0f32; seq_len];
+    let group = n_heads / n_kv_heads;
+    let mut scores = vec![0.0f32; n_ctx];
 
-    // index of head `hh` (of `n` heads) at position `t`, dim 0
-    let head_off = |t: usize, hh: usize, n: usize| (t * n + hh) * head_dim;
+    for h in 0..n_heads {
+        let kv = h / group;
+        let q_vec = &q[h * head_dim..(h + 1) * head_dim];
+        for (j, s) in scores.iter_mut().enumerate() {
+            let k_vec = &k[(j * n_kv_heads + kv) * head_dim..][..head_dim];
+            *s = dot(q_vec, k_vec) * scale;
+        }
+        softmax(&mut scores);
 
-    for t in 0..seq_len {
-        for h in 0..n_heads {
-            let kv = h / group;
-            let q_vec = &q[head_off(t, h, n_heads)..][..head_dim];
-
-            // causal scores over keys 0..=t
-            let scores = &mut scores[..=t];
-            for (j, s) in scores.iter_mut().enumerate() {
-                let k_vec = &k[head_off(j, kv, n_kv_heads)..][..head_dim];
-                *s = dot(q_vec, k_vec) * scale;
-            }
-            softmax(scores);
-
-            // weighted sum of values
-            let out_vec = &mut out[head_off(t, h, n_heads)..][..head_dim];
-            out_vec.fill(0.0);
-            for (j, &w) in scores.iter().enumerate() {
-                let v_vec = &v[head_off(j, kv, n_kv_heads)..][..head_dim];
-                for (o, &vv) in out_vec.iter_mut().zip(v_vec) {
-                    *o += w * vv;
-                }
+        let out_vec = &mut out[h * head_dim..(h + 1) * head_dim];
+        out_vec.fill(0.0);
+        for (j, &w) in scores.iter().enumerate() {
+            let v_vec = &v[(j * n_kv_heads + kv) * head_dim..][..head_dim];
+            for (o, &vv) in out_vec.iter_mut().zip(v_vec) {
+                *o += w * vv;
             }
         }
     }

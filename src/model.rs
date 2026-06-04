@@ -10,10 +10,11 @@ use crate::config::{
     self, CONV_L_CACHE, DENSE_FF, HEAD_DIM, HIDDEN, KV_DIM, MOE_FF, N_EXPERTS, N_EXPERTS_USED,
     N_HEADS, N_KV_HEADS, N_LAYERS, RMS_EPS, ROPE_THETA, VOCAB,
 };
+use crate::cache::Cache;
 use crate::gguf::{GgufFile, TensorInfo};
 use crate::kernels::activation::{sigmoid_slice, swiglu};
-use crate::kernels::attention::attention;
-use crate::kernels::conv::causal_depthwise_conv;
+use crate::kernels::attention::attention_decode;
+use crate::kernels::conv::conv_step;
 use crate::kernels::elementwise::{add_assign, add_scaled};
 use crate::kernels::matmul::matvec;
 use crate::kernels::rmsnorm::rmsnorm;
@@ -58,152 +59,163 @@ impl Model {
         &self.gguf
     }
 
-    // --- forward pass ---
+    // --- forward pass (single-token, cached) ---
 
-    /// Run the prompt (token ids) through the model and return the logits for the **last**
-    /// position (length [`VOCAB`]). No KV/conv cache yet — recomputes the whole sequence.
+    /// Run the prompt through the model and return the logits for the **last** position
+    /// (length [`VOCAB`]), using a fresh cache internally.
     pub fn forward(&self, tokens: &[u32]) -> Vec<f32> {
-        let seq = tokens.len();
-        assert!(seq > 0, "forward: empty token sequence");
-
-        // Embedding: row `tok` of token_embd (Q6_K) is the embedding of token `tok`.
-        let tok_embd = self.tensor("token_embd.weight").expect("token_embd");
-        let embd_bytes = self.data(tok_embd);
-        let (blk_elems, blk_bytes) = tok_embd.ggml_type.block().expect("embd block");
-        let row_bytes = (HIDDEN / blk_elems as usize) * blk_bytes as usize;
-        let mut h = vec![0.0f32; seq * HIDDEN];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let off = tok as usize * row_bytes;
-            crate::kernels::dequant::dequantize_into(
-                tok_embd.ggml_type,
-                &embd_bytes[off..off + row_bytes],
-                &mut h[t * HIDDEN..(t + 1) * HIDDEN],
-            );
+        assert!(!tokens.is_empty(), "forward: empty token sequence");
+        let mut cache = Cache::new();
+        let mut logits = Vec::new();
+        for &tok in tokens {
+            logits = self.forward_step(tok, &mut cache);
         }
+        logits
+    }
 
-        // Decoder layers: pre-norm, residual-first.
+    /// Process one token at position `cache.pos`, update the KV + conv-state caches, and
+    /// return its next-token logits. One pass over the weights, plus O(context) attention.
+    pub fn forward_step(&self, token: u32, cache: &mut Cache) -> Vec<f32> {
+        let pos = cache.pos;
+        let mut h = vec![0.0f32; HIDDEN];
+        self.embed_token(token, &mut h);
+
         for layer in 0..N_LAYERS {
-            let normed = self.norm_seq(&h, &name(layer, "attn_norm.weight"), seq);
+            let normed = self.norm_one(&h, &name(layer, "attn_norm.weight"));
             let op = if config::is_attention(layer) {
-                self.attention_op(layer, &normed, seq)
+                self.attn_step(layer, &normed, pos, cache)
             } else {
-                self.conv_op(layer, &normed, seq)
+                self.conv_step_op(layer, &normed, cache)
             };
             add_assign(&mut h, &op);
 
-            let normed = self.norm_seq(&h, &name(layer, "ffn_norm.weight"), seq);
+            let normed = self.norm_one(&h, &name(layer, "ffn_norm.weight"));
             let ffn = if config::is_dense_ffn(layer) {
-                self.dense_ffn(layer, &normed, seq)
+                self.dense_ffn(layer, &normed)
             } else {
-                self.moe_ffn(layer, &normed, seq)
+                self.moe_ffn(layer, &normed)
             };
             add_assign(&mut h, &ffn);
         }
 
-        // Final norm on the last position, then tied logits = token_embd · h.
-        let last = &h[(seq - 1) * HIDDEN..seq * HIDDEN];
         let gain = self.dequant_vec("token_embd_norm.weight");
-        let mut normed_last = vec![0.0f32; HIDDEN];
-        rmsnorm(last, &gain, RMS_EPS, &mut normed_last);
+        let mut normed = vec![0.0f32; HIDDEN];
+        rmsnorm(&h, &gain, RMS_EPS, &mut normed);
+        let tok_embd = self.tensor("token_embd.weight").expect("token_embd");
         let mut logits = vec![0.0f32; VOCAB];
-        matvec(tok_embd.ggml_type, embd_bytes, HIDDEN, VOCAB, &normed_last, &mut logits);
+        matvec(tok_embd.ggml_type, self.data(tok_embd), HIDDEN, VOCAB, &normed, &mut logits);
+
+        cache.pos += 1;
         logits
     }
 
-    /// Autoregressive generation. Recomputes the whole sequence each step (no cache yet),
-    /// so cost grows with length. Stops at `eos` or after `max_new` tokens. Returns the
-    /// newly generated token ids (not including the prompt).
+    /// Autoregressive generation with the KV + conv caches: prefill the prompt, then decode
+    /// one token at a time. Stops at `eos` or after `max_new` tokens. Returns the new ids.
     pub fn generate(&self, prompt: &[u32], sampler: &mut Sampler, max_new: usize, eos: u32) -> Vec<u32> {
-        let mut tokens = prompt.to_vec();
+        assert!(!prompt.is_empty(), "generate: empty prompt");
+        let mut cache = Cache::new();
+        let mut history = prompt.to_vec();
+
+        // Prefill: the last prompt token's logits predict the first new token.
+        let mut logits = Vec::new();
+        for &tok in prompt {
+            logits = self.forward_step(tok, &mut cache);
+        }
+
         let mut generated = Vec::with_capacity(max_new);
         for _ in 0..max_new {
-            let mut logits = self.forward(&tokens);
-            let next = sampler.sample(&mut logits, &tokens);
-            tokens.push(next);
+            let next = sampler.sample(&mut logits, &history);
             generated.push(next);
+            history.push(next);
             if next == eos {
                 break;
             }
+            logits = self.forward_step(next, &mut cache);
         }
         generated
     }
 
-    /// Gated short-conv operator: in_proj → (B·x) → causal conv → (C·) → out_proj.
-    fn conv_op(&self, layer: usize, x: &[f32], seq: usize) -> Vec<f32> {
-        // in_proj: HIDDEN -> 3*HIDDEN, split per position into [B | C | x].
-        let mut bcx = vec![0.0f32; seq * 3 * HIDDEN];
-        self.matvec_seq(&name(layer, "shortconv.in_proj.weight"), x, seq, HIDDEN, 3 * HIDDEN, &mut bcx);
+    /// Embedding lookup: dequantize row `token` of token_embd into `out` (`HIDDEN`).
+    fn embed_token(&self, token: u32, out: &mut [f32]) {
+        let te = self.tensor("token_embd.weight").expect("token_embd");
+        let (blk_elems, blk_bytes) = te.ggml_type.block().expect("embd block");
+        let row_bytes = (HIDDEN / blk_elems as usize) * blk_bytes as usize;
+        let off = token as usize * row_bytes;
+        crate::kernels::dequant::dequantize_into(te.ggml_type, &self.data(te)[off..off + row_bytes], out);
+    }
 
-        let mut bx = vec![0.0f32; seq * HIDDEN];
-        for t in 0..seq {
-            let base = t * 3 * HIDDEN;
-            let b = &bcx[base..base + HIDDEN];
-            let xg = &bcx[base + 2 * HIDDEN..base + 3 * HIDDEN];
-            let dst = &mut bx[t * HIDDEN..(t + 1) * HIDDEN];
-            for ((d, &bb), &xx) in dst.iter_mut().zip(b).zip(xg) {
-                *d = bb * xx;
-            }
+    /// Gated short-conv operator for one token, using + updating the conv-state cache.
+    fn conv_step_op(&self, layer: usize, x: &[f32], cache: &mut Cache) -> Vec<f32> {
+        let mut bcx = vec![0.0f32; 3 * HIDDEN];
+        self.matvec1(&name(layer, "shortconv.in_proj.weight"), x, HIDDEN, 3 * HIDDEN, &mut bcx);
+
+        // Bx = B · x_gate (chunks 0 and 2 of the in_proj output).
+        let mut bx = vec![0.0f32; HIDDEN];
+        for (c, bxc) in bx.iter_mut().enumerate() {
+            *bxc = bcx[c] * bcx[2 * HIDDEN + c];
         }
 
         let conv_w = self.dequant_vec(&name(layer, "shortconv.conv.weight"));
-        let mut conv_out = vec![0.0f32; seq * HIDDEN];
-        causal_depthwise_conv(&bx, &conv_w, seq, HIDDEN, CONV_L_CACHE, &mut conv_out);
+        let mut conv_out = vec![0.0f32; HIDDEN];
+        conv_step(&cache.conv[layer], &bx, &conv_w, HIDDEN, CONV_L_CACHE, &mut conv_out);
 
-        let mut y = vec![0.0f32; seq * HIDDEN];
-        for t in 0..seq {
-            let c = &bcx[t * 3 * HIDDEN + HIDDEN..t * 3 * HIDDEN + 2 * HIDDEN];
-            let co = &conv_out[t * HIDDEN..(t + 1) * HIDDEN];
-            let dst = &mut y[t * HIDDEN..(t + 1) * HIDDEN];
-            for ((d, &cc), &c2) in dst.iter_mut().zip(c).zip(co) {
-                *d = cc * c2;
-            }
+        // Shift the conv state left one column and append the current Bx.
+        let state = &mut cache.conv[layer];
+        state.copy_within(HIDDEN.., 0);
+        state[(CONV_L_CACHE - 2) * HIDDEN..].copy_from_slice(&bx);
+
+        // y = C · conv_out (chunk 1), then out_proj.
+        let mut y = vec![0.0f32; HIDDEN];
+        for (c, yc) in y.iter_mut().enumerate() {
+            *yc = bcx[HIDDEN + c] * conv_out[c];
         }
-
-        let mut out = vec![0.0f32; seq * HIDDEN];
-        self.matvec_seq(&name(layer, "shortconv.out_proj.weight"), &y, seq, HIDDEN, HIDDEN, &mut out);
+        let mut out = vec![0.0f32; HIDDEN];
+        self.matvec1(&name(layer, "shortconv.out_proj.weight"), &y, HIDDEN, HIDDEN, &mut out);
         out
     }
 
-    /// GQA attention operator: q/k/v proj → per-head q/k norm → RoPE → SDPA → o_proj.
-    fn attention_op(&self, layer: usize, x: &[f32], seq: usize) -> Vec<f32> {
-        let mut q = vec![0.0f32; seq * HIDDEN];
-        let mut k = vec![0.0f32; seq * KV_DIM];
-        let mut v = vec![0.0f32; seq * KV_DIM];
-        self.matvec_seq(&name(layer, "attn_q.weight"), x, seq, HIDDEN, HIDDEN, &mut q);
-        self.matvec_seq(&name(layer, "attn_k.weight"), x, seq, HIDDEN, KV_DIM, &mut k);
-        self.matvec_seq(&name(layer, "attn_v.weight"), x, seq, HIDDEN, KV_DIM, &mut v);
+    /// GQA attention operator for one token, appending to + reading the KV cache.
+    fn attn_step(&self, layer: usize, x: &[f32], pos: usize, cache: &mut Cache) -> Vec<f32> {
+        let mut q = vec![0.0f32; HIDDEN];
+        let mut k = vec![0.0f32; KV_DIM];
+        let mut v = vec![0.0f32; KV_DIM];
+        self.matvec1(&name(layer, "attn_q.weight"), x, HIDDEN, HIDDEN, &mut q);
+        self.matvec1(&name(layer, "attn_k.weight"), x, HIDDEN, KV_DIM, &mut k);
+        self.matvec1(&name(layer, "attn_v.weight"), x, HIDDEN, KV_DIM, &mut v);
 
         let q_gain = self.dequant_vec(&name(layer, "attn_q_norm.weight"));
         let k_gain = self.dequant_vec(&name(layer, "attn_k_norm.weight"));
-        for t in 0..seq {
-            norm_rope_heads(&mut q[t * HIDDEN..(t + 1) * HIDDEN], N_HEADS, &q_gain, t);
-            norm_rope_heads(&mut k[t * KV_DIM..(t + 1) * KV_DIM], N_KV_HEADS, &k_gain, t);
-        }
+        norm_rope_heads(&mut q, N_HEADS, &q_gain, pos);
+        norm_rope_heads(&mut k, N_KV_HEADS, &k_gain, pos);
 
-        let mut attn_out = vec![0.0f32; seq * HIDDEN];
-        attention(&q, &k, &v, seq, N_HEADS, N_KV_HEADS, HEAD_DIM, &mut attn_out);
+        cache.k[layer].extend_from_slice(&k);
+        cache.v[layer].extend_from_slice(&v);
+        let n_ctx = pos + 1;
 
-        let mut out = vec![0.0f32; seq * HIDDEN];
-        self.matvec_seq(&name(layer, "attn_output.weight"), &attn_out, seq, HIDDEN, HIDDEN, &mut out);
+        let mut attn = vec![0.0f32; HIDDEN];
+        attention_decode(&q, &cache.k[layer], &cache.v[layer], n_ctx, N_HEADS, N_KV_HEADS, HEAD_DIM, &mut attn);
+
+        let mut out = vec![0.0f32; HIDDEN];
+        self.matvec1(&name(layer, "attn_output.weight"), &attn, HIDDEN, HIDDEN, &mut out);
         out
     }
 
-    /// Dense SwiGLU MLP (layers 0,1): down(silu(gate(x)) · up(x)).
-    fn dense_ffn(&self, layer: usize, x: &[f32], seq: usize) -> Vec<f32> {
-        let mut gate = vec![0.0f32; seq * DENSE_FF];
-        let mut up = vec![0.0f32; seq * DENSE_FF];
-        self.matvec_seq(&name(layer, "ffn_gate.weight"), x, seq, HIDDEN, DENSE_FF, &mut gate);
-        self.matvec_seq(&name(layer, "ffn_up.weight"), x, seq, HIDDEN, DENSE_FF, &mut up);
-        let mut act = vec![0.0f32; seq * DENSE_FF];
+    /// Dense SwiGLU MLP (layers 0,1) for one token.
+    fn dense_ffn(&self, layer: usize, x: &[f32]) -> Vec<f32> {
+        let mut gate = vec![0.0f32; DENSE_FF];
+        let mut up = vec![0.0f32; DENSE_FF];
+        self.matvec1(&name(layer, "ffn_gate.weight"), x, HIDDEN, DENSE_FF, &mut gate);
+        self.matvec1(&name(layer, "ffn_up.weight"), x, HIDDEN, DENSE_FF, &mut up);
+        let mut act = vec![0.0f32; DENSE_FF];
         swiglu(&gate, &up, &mut act);
-        let mut out = vec![0.0f32; seq * HIDDEN];
-        self.matvec_seq(&name(layer, "ffn_down.weight"), &act, seq, DENSE_FF, HIDDEN, &mut out);
+        let mut out = vec![0.0f32; HIDDEN];
+        self.matvec1(&name(layer, "ffn_down.weight"), &act, DENSE_FF, HIDDEN, &mut out);
         out
     }
 
-    /// Sparse MoE FFN: sigmoid router, top-4 by (score+bias), normalize the selected
-    /// **sigmoid** scores, weighted sum of the 4 experts' SwiGLU MLPs. Routed per token.
-    fn moe_ffn(&self, layer: usize, x: &[f32], seq: usize) -> Vec<f32> {
+    /// Sparse MoE FFN for one token: sigmoid router, top-4 by (score+bias), normalize the
+    /// selected **sigmoid** scores, weighted sum of the 4 experts' SwiGLU MLPs.
+    fn moe_ffn(&self, layer: usize, x: &[f32]) -> Vec<f32> {
         let router = self.tensor(&name(layer, "ffn_gate_inp.weight")).expect("router");
         let bias = self.dequant_vec(&name(layer, "exp_probs_b.bias"));
         let gate_exps = self.tensor(&name(layer, "ffn_gate_exps.weight")).expect("gate_exps");
@@ -213,62 +225,49 @@ impl Model {
         let up_stride = expert_bytes(up_exps.ggml_type, HIDDEN, MOE_FF);
         let down_stride = expert_bytes(down_exps.ggml_type, MOE_FF, HIDDEN);
 
-        let mut out = vec![0.0f32; seq * HIDDEN];
-        for t in 0..seq {
-            let xt = &x[t * HIDDEN..(t + 1) * HIDDEN];
+        let mut scores = vec![0.0f32; N_EXPERTS];
+        matvec(router.ggml_type, self.data(router), HIDDEN, N_EXPERTS, x, &mut scores);
+        sigmoid_slice(&mut scores);
+        let mut order: Vec<usize> = (0..N_EXPERTS).collect();
+        order.sort_unstable_by(|&a, &b| (scores[b] + bias[b]).total_cmp(&(scores[a] + bias[a])));
+        let sel = &order[..N_EXPERTS_USED];
 
-            // Router -> sigmoid scores; select top-k by (score + bias).
-            let mut scores = vec![0.0f32; N_EXPERTS];
-            matvec(router.ggml_type, self.data(router), HIDDEN, N_EXPERTS, xt, &mut scores);
-            sigmoid_slice(&mut scores);
-            let mut order: Vec<usize> = (0..N_EXPERTS).collect();
-            order.sort_unstable_by(|&a, &b| {
-                (scores[b] + bias[b]).total_cmp(&(scores[a] + bias[a]))
-            });
-            let sel = &order[..N_EXPERTS_USED];
+        // Weights are the (bias-free) sigmoid scores of the selected experts, normalized.
+        let mut w: Vec<f32> = sel.iter().map(|&e| scores[e]).collect();
+        let denom: f32 = w.iter().sum::<f32>() + 1e-6;
+        for wi in w.iter_mut() {
+            *wi /= denom;
+        }
 
-            // Weights are the (bias-free) sigmoid scores of the selected experts, normalized.
-            let mut w: Vec<f32> = sel.iter().map(|&e| scores[e]).collect();
-            let denom: f32 = w.iter().sum::<f32>() + 1e-6;
-            for wi in w.iter_mut() {
-                *wi /= denom;
-            }
-
-            let out_t = &mut out[t * HIDDEN..(t + 1) * HIDDEN];
-            for (i, &e) in sel.iter().enumerate() {
-                let gate_w = &self.data(gate_exps)[e * gate_stride..(e + 1) * gate_stride];
-                let up_w = &self.data(up_exps)[e * up_stride..(e + 1) * up_stride];
-                let down_w = &self.data(down_exps)[e * down_stride..(e + 1) * down_stride];
-                let mut g = vec![0.0f32; MOE_FF];
-                let mut u = vec![0.0f32; MOE_FF];
-                matvec(gate_exps.ggml_type, gate_w, HIDDEN, MOE_FF, xt, &mut g);
-                matvec(up_exps.ggml_type, up_w, HIDDEN, MOE_FF, xt, &mut u);
-                let mut act = vec![0.0f32; MOE_FF];
-                swiglu(&g, &u, &mut act);
-                let mut down = vec![0.0f32; HIDDEN];
-                matvec(down_exps.ggml_type, down_w, MOE_FF, HIDDEN, &act, &mut down);
-                add_scaled(out_t, &down, w[i]);
-            }
+        let mut out = vec![0.0f32; HIDDEN];
+        for (i, &e) in sel.iter().enumerate() {
+            let gate_w = &self.data(gate_exps)[e * gate_stride..(e + 1) * gate_stride];
+            let up_w = &self.data(up_exps)[e * up_stride..(e + 1) * up_stride];
+            let down_w = &self.data(down_exps)[e * down_stride..(e + 1) * down_stride];
+            let mut g = vec![0.0f32; MOE_FF];
+            let mut u = vec![0.0f32; MOE_FF];
+            matvec(gate_exps.ggml_type, gate_w, HIDDEN, MOE_FF, x, &mut g);
+            matvec(up_exps.ggml_type, up_w, HIDDEN, MOE_FF, x, &mut u);
+            let mut act = vec![0.0f32; MOE_FF];
+            swiglu(&g, &u, &mut act);
+            let mut down = vec![0.0f32; HIDDEN];
+            matvec(down_exps.ggml_type, down_w, MOE_FF, HIDDEN, &act, &mut down);
+            add_scaled(&mut out, &down, w[i]);
         }
         out
     }
 
-    /// Apply `matvec` to every position of a `seq × n_in` input, writing `seq × n_out`.
-    fn matvec_seq(&self, tensor: &str, x: &[f32], seq: usize, n_in: usize, n_out: usize, out: &mut [f32]) {
-        let t = self.tensor(tensor).expect("matvec_seq: tensor");
-        let data = self.data(t);
-        for p in 0..seq {
-            matvec(t.ggml_type, data, n_in, n_out, &x[p * n_in..(p + 1) * n_in], &mut out[p * n_out..(p + 1) * n_out]);
-        }
+    /// Single-vector `matvec` against a named weight.
+    fn matvec1(&self, tensor: &str, x: &[f32], n_in: usize, n_out: usize, out: &mut [f32]) {
+        let t = self.tensor(tensor).expect("matvec1: tensor");
+        matvec(t.ggml_type, self.data(t), n_in, n_out, x, out);
     }
 
-    /// RMSNorm every position of `h` (`seq × HIDDEN`) with the named F32 gain.
-    fn norm_seq(&self, h: &[f32], gain_name: &str, seq: usize) -> Vec<f32> {
+    /// RMSNorm one `HIDDEN` vector with the named F32 gain.
+    fn norm_one(&self, h: &[f32], gain_name: &str) -> Vec<f32> {
         let gain = self.dequant_vec(gain_name);
-        let mut out = vec![0.0f32; seq * HIDDEN];
-        for t in 0..seq {
-            rmsnorm(&h[t * HIDDEN..(t + 1) * HIDDEN], &gain, RMS_EPS, &mut out[t * HIDDEN..(t + 1) * HIDDEN]);
-        }
+        let mut out = vec![0.0f32; HIDDEN];
+        rmsnorm(h, &gain, RMS_EPS, &mut out);
         out
     }
 

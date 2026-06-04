@@ -332,7 +332,8 @@ Pure Rust, no system packages. Each justified; minimal tree.
 | Crate | Phase | Why | System deps? |
 |---|---|---|---|
 | `memmap2` | core | mmap the ~5 GB GGUF: lazy paging, shared page cache, no 5 GB upfront read+alloc | None — pure-Rust FFI to system libc; nothing to install. |
-| `rayon` | phase 2 (opt) | data-parallel matmul rows / per-expert / per-head work across cores | None — built on std threads. |
+| `rayon` | phase 2 (opt 9c) | data-parallel matmul rows / per-expert / per-head work across cores | None — built on std threads. |
+| `wide` | phase 2 (opt 9d) | cross-platform portable SIMD (`f32x8`) for dot/dequant; compiles to SSE/AVX2/NEON | None — pure Rust, no nightly. |
 
 > `half` was **dropped**: the file has no F16/BF16 whole tensors, so we only need f16→f32
 > for in-block scales — hand-rolled as a tested ~25-line `f16_to_f32` in
@@ -343,26 +344,11 @@ Pure Rust, no system packages. Each justified; minimal tree.
 - **CLI args** → `std::env::args` by hand (no `clap`).
 - **Sampling RNG** → ~10-line PCG/xorshift (no `rand`).
 - **Errors** → `Box<dyn Error>` / small enums (no `anyhow`/`thiserror`).
-- **SIMD** (phase 2) → `std::arch` intrinsics with `is_*_feature_detected!` (no crate);
-  optionally `wide` for portable pure-Rust SIMD without nightly.
+- **SIMD** (phase 2) → favor **cross-platform** portable SIMD via the `wide` crate
+  (pure Rust, stable, no system deps) over `std::arch` platform intrinsics. `std::simd`
+  is equivalent but nightly-only.
 - **Tokenizer** → hand-rolled byte-level BPE on UTF-8 (no `regex`, no `tokenizers`; the
   latter's default `onig` feature is a C library = forbidden system dep).
-
----
-
-## Optimizations (phased)
-
-1. **Correctness, single-core, scalar.** Match a reference on next-token logits.
-2. **KV cache + conv-state cache.** (Listed as a core feature; needed for usable decode.)
-3. **Quantized GEMV without full materialization.** Dequantize a weight block, use it
-   immediately against the activation, accumulate — keeps the weight in cache, avoids a
-   second pass over a dequantized buffer.
-4. **Multithreading (`rayon`).** Parallelize over output rows (matmul), experts (MoE),
-   and heads (attention).
-5. **SIMD (`std::arch`).** Vectorize dequant + dot-products (AVX2/FMA on x86, NEON on
-   Apple silicon). Block/tile GEMM for prefill.
-6. **MoE sparsity.** Only run the 4 selected experts per token (the whole point of A1B).
-7. **f16 KV cache** to cut decode-time memory bandwidth.
 
 ---
 
@@ -379,7 +365,7 @@ src/
   tensor.rs          # ✓ dtype enum + block sizing
   config.rs          # ✓ hardcoded architecture consts + validate(&gguf)
   model.rs           # ✓ weight loading + static forward pass (embed→layers→norm→logits)
-  cache.rs           #   KV cache + conv-state cache
+  cache.rs           # ✓ KV cache (attn) + conv-state cache (conv)
   sampler.rs         # ✓ temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
   tokenizer.rs       # ✓ byte-level BPE from GGUF (hand-rolled lfm2 pretokenizer, no regex)
   kernels/
@@ -409,7 +395,9 @@ src/
    `activation` (SiLU/SwiGLU), `elementwise`, `conv`, `attention`; wired the static layer
    loop (embed → 24 layers → final norm → logits) incl. MoE routing. (Correctness
    confirmed end-to-end by the milestone-8 continuation test, not a logit-reference script.)
-6. **KV + conv-state caches**; multi-token prefill then incremental decode.
+6. ✅ **KV + conv-state caches** (`cache.rs`): single-token cached forward path
+   (`forward_step`), prefill-then-decode generation. Output bit-identical to the
+   uncached path; generation now O(n) (4 tok 34s→13s, 16 tok ~29s vs ~230s).
 7. ✅ **Sampling + generation** (`sampler.rs`, `Model::generate`): one sampler (temp +
    top-k, temp 0 = greedy, rep penalty), hand-rolled PRNG; autoregressive loop (no cache
    yet). `bebelm generate` works on raw token ids.
@@ -417,18 +405,35 @@ src/
    pre-tokenizer (no `regex`), GPT-2 byte↔char table, merges. Round-trips on the real
    vocab. **Correctness gate PASSED:** `bebelm complete … "The capital of France is"` →
    " the city of Paris" (fluent + factually correct), validating the whole pipeline.
-9. **Optimizations:** sparse-expert execution, rayon, SIMD, f16 KV cache.
+9. **Optimizations** (sub-items 9a–9h in the *Optimizations* section above; ordered
+   easiest-first with impact estimates). Baseline already has MoE sparsity + caches;
+   suggested next: 9a/9b (quick), 9c (`rayon`, biggest win), then 9d/9e (`wide` SIMD +
+   fusion). Cross-platform portable SIMD via the `wide` crate, not `std::arch`.
   - TODO: break this down into sub-steps
+  - llama.cpp has a custom GEMM (matrix multiply) and MoE routing kernels tuned for
+    hybrid (convolution + attention) architecture. We could potentially take inspiration
+    from this, but we should probably start by profiling our current kernels.
 10. **Cleanup:** remove unused code and validation code that is no longer needed.
 
-### Design note: static forward pass
+## Optimizations
 
-The architecture is fixed (one target model), so it lives in `config.rs` as compile-time
-`const`s, not runtime-parsed config. The forward pass is written as plain static code
-using those consts (e.g. `const HIDDEN = 2048`, a `const` conv/attn schedule) — **not** a
-code generator and **not** a runtime config interpreter. We still load the ~4.8 GB of
-weights at runtime (they can't live in the binary) and look them up **by name** (offsets
-are file-specific and fragile). `config::validate(&gguf)` asserts the file matches the
-constants at startup, so a wrong/updated file fails loudly. Benefits: const dimensions
-let the compiler elide bounds checks / use fixed-size buffers, and the forward pass stays
-readable and debuggable.
+Baseline after milestone 6: single-core scalar, ~1.3 s/token (dominated by `matvec` —
+dequantize-on-the-fly + dot, re-done per token). Already in place: **MoE sparsity** (only
+the top-4 experts run per token) and the **KV + conv-state caches** (decode is O(n)).
+
+Ordered easiest → hardest, with rough impact. Effects are roughly **multiplicative**
+(threads × SIMD-lanes × cache), so the combined ceiling is large (~10–30× over baseline).
+
+| # | Optimization | Effort | Rough impact |
+|---|---|---|---|
+| **9a** | **Skip prefill logits** — only the last prompt token needs the `2048×128000` logit matmul; skip it for the other prefill tokens. | trivial | prefill only: ~10–15% per skipped prompt token; no decode effect |
+| **9b** | **Precompute small F32 tensors at load** (norm gains, conv filters, router biases) and cut per-step `Vec` allocations / repeated dequant. | easy | small, ~5%; removes allocation churn |
+| **9c** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). | easy | **HIGH ≈ core count** (≈4–8× here) |
+| **9d** | **Cross-platform SIMD for dot + dequant MAC** — use the **`wide`** crate (`f32x8`; stable, pure-Rust, compiles to SSE/AVX2/NEON). Favor this over `std::arch` intrinsics; `std::simd` is equivalent but nightly-only. | moderate | ~2–4× on `matvec` compute; multiplies with 9c |
+| **9e** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | ~1.3–2×; combines with 9d |
+| **9f** | **Batched GEMM prefill** — dequantize each weight row once and apply to all prompt tokens at once (vs. once per token). | moderate | prefill only: ≈ prompt-length×; no decode effect |
+| **9g** | **f16 KV cache** — store K/V as f16 to halve attention memory bandwidth. | easy–moderate | small now; grows with context length |
+| **9h** | **Q8 activation + integer block dot** (llama.cpp `vec_dot` style) — quantize the activation to Q8 and dot directly against Q4_K/Q6_K quants, skipping full f32 dequant. The main algorithmic CPU trick; supersedes 9d/9e on the hot path. | hard | **HIGH ~2–4×**, but most complex |
+
+Suggested order: **9a, 9b** (quick), then **9c** (biggest single win), then **9d/9e**
+(SIMD + fusion). 9f for long prompts, 9g for long contexts, 9h last (largest rewrite).
