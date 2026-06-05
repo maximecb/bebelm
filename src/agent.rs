@@ -13,7 +13,8 @@ use crate::cache::Cache;
 use crate::model::Model;
 use crate::sampler::Sampler;
 use crate::tokenizer::{
-    Tokenizer, TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD,
+    Tokenizer, TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD, TOKEN_THINK,
+    TOKEN_THINK_END,
 };
 
 /// Default per-turn generation cap. A reasoning (`<think>`) turn can run long, so this is
@@ -86,6 +87,9 @@ pub struct Agent<'m> {
     history: Vec<u32>,
     max_gen: usize,
     max_context: usize,
+    /// Cap on `<think>…</think>` reasoning tokens before `</think>` is forced; `usize::MAX`
+    /// leaves reasoning unbounded.
+    max_think: usize,
 }
 
 impl<'m> Agent<'m> {
@@ -101,6 +105,7 @@ impl<'m> Agent<'m> {
             history: Vec::new(),
             max_gen: DEFAULT_MAX_GEN,
             max_context: DEFAULT_MAX_CONTEXT,
+            max_think: usize::MAX,
         })
     }
 
@@ -139,6 +144,13 @@ impl<'m> Agent<'m> {
     /// Cap the total transcript length (tokens) the agent will decode up to.
     pub fn max_context(mut self, n: usize) -> Self {
         self.max_context = n;
+        self
+    }
+
+    /// Limit the `<think>…</think>` reasoning block to `n` tokens: once `n` reasoning tokens
+    /// have been produced, `</think>` is forced so the model proceeds to its answer.
+    pub fn max_think(mut self, n: usize) -> Self {
+        self.max_think = n;
         self
     }
 
@@ -198,10 +210,28 @@ impl<'m> Agent<'m> {
         // Decode one token at a time, feeding each back through the caches.
         let t_decode = Instant::now();
         let mut ids = Vec::new();
+        // Track the <think>…</think> reasoning block so it can be capped at `max_think`.
+        let mut thinking = false;
+        let mut think_count = 0usize;
         let stop = loop {
-            let next = self.sampler.sample(&mut logits, &self.history);
+            // Once the reasoning budget is spent, force `</think>` instead of sampling; the model
+            // then continues from there into its answer.
+            let next = if thinking && think_count >= self.max_think {
+                TOKEN_THINK_END
+            } else {
+                self.sampler.sample(&mut logits, &self.history)
+            };
             if next == self.tok.eos || STOP_TOKENS.contains(&next) {
                 break StopReason::Eos;
+            }
+            match next {
+                TOKEN_THINK => {
+                    thinking = true;
+                    think_count = 0;
+                }
+                TOKEN_THINK_END => thinking = false,
+                _ if thinking => think_count += 1,
+                _ => {}
             }
             let text = self.tok.decode(&[next]);
             on_token(next, &text);
