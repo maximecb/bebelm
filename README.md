@@ -29,6 +29,30 @@ export BEBELM_WEIGHTS_FILE=/path/to/LFM2.5-8B-A1B-Q4_K_M.gguf
 `benchmark.sh` and `profile.sh` default to this filename in the repo root; you can also pass a
 different path as their first argument (they set `BEBELM_WEIGHTS_FILE` for you).
 
+### Command-line interface
+
+Build with `cargo build --release`, then run a subcommand on `./target/release/bebelm` (the
+examples below use `cargo run --release --` for convenience). Every subcommand loads the
+weights from `BEBELM_WEIGHTS_FILE` (see above).
+
+- **`chat [max-new]`** — interactive multi-turn chat. Streams the model's full output, showing
+  the `<think>…</think>` reasoning and the final answer in different colors. `max-new` caps the
+  tokens generated per turn (default 2048). `Ctrl-D` or `/exit` to quit.
+- **`complete <max-new> <text>…`** — greedy text completion of a prompt; streams tokens as they
+  are produced and reports prefill/decode throughput.
+- **`tokenize <text>…`** — encode text to token ids and decode it back (a vocab round-trip check).
+- **`generate <max-new> <token-id>…`** — greedy-generate from raw prompt token ids.
+- **`logits <token-id>…`** — run one forward pass on raw token ids and print a summary of the
+  next-token logits (argmax + top-5).
+
+```sh
+# Interactive chat
+cargo run --release -- chat
+
+# One-shot completion
+cargo run --release -- complete 64 "The capital of France is"
+```
+
 ### CPU / SIMD build
 
 The x86 SIMD kernels are tuned for the machine you build on: `.cargo/config.toml` sets

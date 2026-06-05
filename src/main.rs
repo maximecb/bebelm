@@ -207,9 +207,12 @@ fn cmd_logits(path: &str, token_args: &[String]) -> Cmd {
 }
 
 /// ANSI colors for the chat UI, blanked when stdout is not a terminal (e.g. piped to a file).
+/// The model's reply is shown in two colors: the `<think>…</think>` reasoning (`think`) and
+/// the actual answer that follows (`answer`).
 struct Palette {
     user: &'static str,
-    model: &'static str,
+    think: &'static str,
+    answer: &'static str,
     dim: &'static str,
     reset: &'static str,
 }
@@ -217,9 +220,15 @@ struct Palette {
 impl Palette {
     fn detect() -> Self {
         if io::stdout().is_terminal() {
-            Palette { user: "\x1b[1;32m", model: "\x1b[36m", dim: "\x1b[2m", reset: "\x1b[0m" }
+            Palette {
+                user: "\x1b[1;32m",  // bold green
+                think: "\x1b[36m",   // cyan
+                answer: "\x1b[31m",  // red
+                dim: "\x1b[2m",
+                reset: "\x1b[0m",
+            }
         } else {
-            Palette { user: "", model: "", dim: "", reset: "" }
+            Palette { user: "", think: "", answer: "", dim: "", reset: "" }
         }
     }
 }
@@ -230,9 +239,9 @@ const CHAT_MAX_NEW: usize = 2048;
 
 /// Interactive multi-turn chat. Builds a ChatML transcript of token ids and regenerates from
 /// the whole conversation each turn (simple — no cross-turn KV-cache reuse yet). The model's
-/// full output, including the `<think>…</think>` reasoning, is streamed in a distinct color;
-/// only the terminating `<|im_end|>` is suppressed. Decoding is greedy and there is no system
-/// prompt; prior assistant turns are kept verbatim (reasoning included) in the context.
+/// full output is streamed, with the `<think>…</think>` reasoning shown in a different colour
+/// from the actual answer; only the terminating `<|im_end|>` is suppressed. Decoding is greedy
+/// and there is no system prompt; prior assistant turns are kept verbatim (reasoning included).
 fn cmd_chat(path: &str, args: &[String]) -> Cmd {
     let max_new: usize = match args.first() {
         Some(s) => s.parse().map_err(|_| format!("invalid max-new {s:?}"))?,
@@ -276,14 +285,27 @@ fn cmd_chat(path: &str, args: &[String]) -> Cmd {
         let seg = format!("{lead}<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n");
         convo.extend(tok.encode(&seg, first));
 
-        // Stream the reply (all but the terminating <|im_end|>) in the model color.
-        print!("{}", pal.model);
+        // Blank line between the user's message and the model's reply.
+        println!();
+
+        // Stream the reply (all but the terminating <|im_end|>). The model opens with a
+        // <think>…</think> reasoning block; colour that distinctly from the answer that
+        // follows. Start in the answer colour so a reply with no <think> block still reads.
+        print!("{}", pal.answer);
         io::stdout().flush().ok();
         let (generated, stats) = model.generate_with_stats(&convo, &mut sampler, max_new, eos, |t| {
-            if t != eos {
-                print!("{}", tok.decode(&[t]));
-                io::stdout().flush().ok();
+            if t == eos {
+                return;
             }
+            if t == tokenizer::TOKEN_THINK {
+                print!("{}", pal.think);
+            }
+            print!("{}", tok.decode(&[t]));
+            if t == tokenizer::TOKEN_THINK_END {
+                println!(); // blank line after the reasoning block
+                print!("{}", pal.answer);
+            }
+            io::stdout().flush().ok();
         });
         println!("{}", pal.reset);
         println!(
@@ -293,6 +315,7 @@ fn cmd_chat(path: &str, args: &[String]) -> Cmd {
             stats.decode_tps(),
             pal.reset
         );
+        println!(); // blank line after the turn, before the next prompt
 
         convo.extend(generated);
     }
