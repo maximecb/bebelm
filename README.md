@@ -10,7 +10,16 @@ packages to run, making it easy to build and run.
 This is a library crate so the model can be imported. There is also a basic command-line
 interface that you can use.
 
-### Download the weights
+### Setup instructions
+
+Install cargo or update your rust toolchain:
+```sh
+# Install Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Update Rust toolchain
+rustup update
+```
 
 Running requires the ~5.2 GB Q4_K_M GGUF. Download it into the repo root:
 
@@ -19,15 +28,12 @@ curl -L -o LFM2.5-8B-A1B-Q4_K_M.gguf \
   "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf"
 ```
 
-The CLI reads the weights path from the `BEBELM_WEIGHTS_FILE` environment variable, defaulting
-to `./LFM2.5-8B-A1B-Q4_K_M.gguf` (repo root). You can point it elsewhere with:
+The CLI reads the weights path from the `BEBELM_WEIGHTS_FILE` environment variable. This defaults
+to `./LFM2.5-8B-A1B-Q4_K_M.gguf` (repo root). You can optionally point it elsewhere with:
 
 ```sh
 export BEBELM_WEIGHTS_FILE=/path/to/LFM2.5-8B-A1B-Q4_K_M.gguf
 ```
-
-`benchmark.sh` and `profile.sh` default to this filename in the repo root; you can also pass a
-different path as their first argument (they set `BEBELM_WEIGHTS_FILE` for you).
 
 ### Command-line interface
 
@@ -36,8 +42,10 @@ examples below use `cargo run --release --` for convenience). Every subcommand l
 weights from `BEBELM_WEIGHTS_FILE` (see above).
 
 - **`chat [max-new]`** — interactive multi-turn chat. Streams the model's full output, showing
-  the `<think>…</think>` reasoning and the final answer in different colors. `max-new` caps the
-  tokens generated per turn (default 2048). `Ctrl-D` or `/exit` to quit.
+  the `<think>...</think>` reasoning and the final answer in different colors. The KV / conv
+  caches persist across turns, so each message only prefills its own new tokens. Sampling uses
+  the model's recommended defaults. `max-new` caps the tokens generated per turn (default 2048).
+  `Ctrl-D` or `/exit` to quit.
 - **`complete <max-new> <text>…`** — greedy text completion of a prompt; streams tokens as they
   are produced and reports prefill/decode throughput.
 - **`tokenize <text>…`** — encode text to token ids and decode it back (a vocab round-trip check).

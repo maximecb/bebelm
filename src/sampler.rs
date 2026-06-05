@@ -4,6 +4,9 @@
 //! Defaults follow Liquid's recommendation for LFM2.5-8B-A1B: temperature 0.2, top-k 80,
 //! repeat-penalty 1.05.
 
+/// Default PRNG seed for non-greedy sampling when the caller doesn't supply one.
+const DEFAULT_SEED: u64 = 0x853C_49E6_748F_EA9B;
+
 /// Sampling configuration + PRNG state.
 pub struct Sampler {
     /// `0.0` ⇒ greedy (deterministic argmax).
@@ -23,6 +26,12 @@ impl Sampler {
     /// Deterministic greedy decoding (argmax, no penalty).
     pub fn greedy() -> Self {
         Self::new(0.0, 0, 1.0, 0)
+    }
+
+    /// Liquid's recommended decoding for LFM2.5-8B-A1B: temperature 0.2, top-k 80,
+    /// repeat-penalty 1.05.
+    pub fn recommended() -> Self {
+        Self::new(0.2, 80, 1.05, DEFAULT_SEED)
     }
 
     /// Pick the next token id from `logits` (mutated in place by the penalty/temperature).

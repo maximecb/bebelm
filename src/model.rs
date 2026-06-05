@@ -133,7 +133,7 @@ impl Model {
     /// Embed + run the 24 decoder layers for one token (updating the KV/conv caches and
     /// `cache.pos`), returning the final hidden state — *without* the logits projection.
     /// Used for prefill tokens whose logits aren't needed (9a).
-    fn run_layers(&self, token: u32, cache: &mut Cache) -> Vec<f32> {
+    pub(crate) fn run_layers(&self, token: u32, cache: &mut Cache) -> Vec<f32> {
         let pos = cache.pos;
         let mut h = vec![0.0f32; HIDDEN];
         self.embed_token(token, &mut h);

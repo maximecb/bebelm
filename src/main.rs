@@ -17,6 +17,7 @@ fn weights_path() -> String {
     std::env::var("BEBELM_WEIGHTS_FILE").unwrap_or_else(|_| DEFAULT_WEIGHTS_FILE.to_string())
 }
 
+use bebelm::agent::Agent;
 use bebelm::config;
 use bebelm::gguf::GgufFile;
 use bebelm::model::Model;
@@ -233,30 +234,22 @@ impl Palette {
     }
 }
 
-/// Default per-turn generation cap. A reasoning turn (the `<think>` block) can run long, so
-/// this is generous; it only bounds a runaway turn. Override with `bebelm chat <max-new>`.
-const CHAT_MAX_NEW: usize = 2048;
-
-/// Interactive multi-turn chat. Builds a ChatML transcript of token ids and regenerates from
-/// the whole conversation each turn (simple — no cross-turn KV-cache reuse yet). The model's
-/// full output is streamed, with the `<think>…</think>` reasoning shown in a different colour
-/// from the actual answer; only the terminating `<|im_end|>` is suppressed. Decoding is greedy
-/// and there is no system prompt; prior assistant turns are kept verbatim (reasoning included).
+/// Interactive multi-turn chat. Keeps one [`Agent`] alive across turns, so each message only
+/// prefills its own newly appended tokens — the KV / conv caches persist instead of being
+/// rebuilt over the whole conversation. The reply is streamed, with the `<think>…</think>`
+/// reasoning shown in a different colour from the answer; the terminating `<|im_end|>` is
+/// suppressed. Sampling uses the model's recommended defaults; there is no system prompt.
 fn cmd_chat(path: &str, args: &[String]) -> Cmd {
-    let max_new: usize = match args.first() {
-        Some(s) => s.parse().map_err(|_| format!("invalid max-new {s:?}"))?,
-        None => CHAT_MAX_NEW,
-    };
-
     let model = Model::load(path)?;
-    let tok = Tokenizer::from_gguf(model.gguf())?;
+    let mut agent = Agent::new(&model)?;
+    if let Some(s) = args.first() {
+        let max_new = s.parse().map_err(|_| format!("invalid max-new {s:?}"))?;
+        agent = agent.max_new(max_new);
+    }
     let pal = Palette::detect();
-    let eos = tok.eos;
 
     eprintln!("Chat ready. Type a message. Input Ctrl-D or /exit to quit.\n");
 
-    let mut convo: Vec<u32> = Vec::new();
-    let mut sampler = Sampler::greedy();
     let stdin = io::stdin();
     let mut line = String::new();
 
@@ -265,7 +258,7 @@ fn cmd_chat(path: &str, args: &[String]) -> Cmd {
         io::stdout().flush().ok();
         line.clear();
         if stdin.read_line(&mut line)? == 0 {
-            println!(); // terminate the prompt line on Ctrl-D
+            println!(); // Terminate the prompt line on Ctrl-D.
             break;
         }
         let msg = line.trim();
@@ -276,33 +269,23 @@ fn cmd_chat(path: &str, args: &[String]) -> Cmd {
             break;
         }
 
-        // Append this user turn + the assistant opener. The model emits its own `<think>`
-        // after the opener, so we don't force it. Each prior turn ends at the assistant's
-        // `<|im_end|>`, so turns after the first start with the separating newline. BOS is
-        // prepended only on the very first segment.
-        let first = convo.is_empty();
-        let lead = if first { "" } else { "\n" };
-        let seg = format!("{lead}<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n");
-        convo.extend(tok.encode(&seg, first));
+        agent.append_user(msg);
 
         // Blank line between the user's message and the model's reply.
         println!();
 
-        // Stream the reply (all but the terminating <|im_end|>). The model opens with a
-        // <think>…</think> reasoning block; colour that distinctly from the answer that
-        // follows. Start in the answer colour so a reply with no <think> block still reads.
+        // Stream the reply. The model opens with a <think>…</think> reasoning block; colour
+        // that distinctly from the answer that follows. Start in the answer colour so a reply
+        // with no <think> block still reads correctly.
         print!("{}", pal.answer);
         io::stdout().flush().ok();
-        let (generated, stats) = model.generate_with_stats(&convo, &mut sampler, max_new, eos, |t| {
-            if t == eos {
-                return;
-            }
-            if t == tokenizer::TOKEN_THINK {
+        let turn = agent.assistant_turn(|id, text| {
+            if id == tokenizer::TOKEN_THINK {
                 print!("{}", pal.think);
             }
-            print!("{}", tok.decode(&[t]));
-            if t == tokenizer::TOKEN_THINK_END {
-                println!(); // blank line after the reasoning block
+            print!("{text}");
+            if id == tokenizer::TOKEN_THINK_END {
+                println!(); // Blank line after the reasoning block.
                 print!("{}", pal.answer);
             }
             io::stdout().flush().ok();
@@ -311,13 +294,11 @@ fn cmd_chat(path: &str, args: &[String]) -> Cmd {
         println!(
             "{}({} tok, {:.1} tok/s){}",
             pal.dim,
-            stats.generated_tokens,
-            stats.decode_tps(),
+            turn.stats.generated_tokens,
+            turn.stats.decode_tps(),
             pal.reset
         );
-        println!(); // blank line after the turn, before the next prompt
-
-        convo.extend(generated);
+        println!(); // Blank line after the turn, before the next prompt.
     }
 
     Ok(())
