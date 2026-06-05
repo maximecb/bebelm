@@ -215,10 +215,29 @@ impl<'m> Agent<'m> {
         // Track the <think>…</think> reasoning block so it can be capped at `max_think`.
         let mut thinking = false;
         let mut think_count = 0usize;
+        // While set, the `<think>` token is barred so the model can't (re)open a reasoning block.
+        // `--no-think` (max_think 0) bars it from the start, so the model answers directly with no
+        // reasoning block at all; a positive budget bars it only after the block is force-closed,
+        // since this model has no native no-think mode and otherwise reopens `<think>` and spirals.
+        let mut think_capped = self.max_think == 0;
+        // Set for the one token right after a `</think>`: it may not be a turn-ender, so the model
+        // can't close the turn with an empty answer (common right after a forced `</think>`).
+        let mut require_answer = false;
         let stop = loop {
+            if think_capped {
+                logits[TOKEN_THINK as usize] = f32::NEG_INFINITY;
+            }
+            if require_answer {
+                logits[self.tok.eos as usize] = f32::NEG_INFINITY;
+                for &t in &STOP_TOKENS {
+                    logits[t as usize] = f32::NEG_INFINITY;
+                }
+                require_answer = false;
+            }
             // Once the reasoning budget is spent, force `</think>` instead of sampling; the model
             // then continues from there into its answer.
             let next = if thinking && think_count >= self.max_think {
+                think_capped = true;
                 TOKEN_THINK_END
             } else {
                 self.sampler.sample(&mut logits, &self.history)
@@ -231,7 +250,10 @@ impl<'m> Agent<'m> {
                     thinking = true;
                     think_count = 0;
                 }
-                TOKEN_THINK_END => thinking = false,
+                TOKEN_THINK_END => {
+                    thinking = false;
+                    require_answer = true;
+                }
                 _ if thinking => think_count += 1,
                 _ => {}
             }
