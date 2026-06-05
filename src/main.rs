@@ -84,7 +84,7 @@ fn parse_tokens(args: &[String]) -> Result<Vec<u32>, Box<dyn Error>> {
 
 /// Greedy-generate token ids from a prompt of token ids (text I/O arrives with the tokenizer).
 fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
-    let max_new: usize = max_str
+    let max_gen: usize = max_str
         .parse()
         .map_err(|_| format!("invalid max-new-tokens {max_str:?}"))?;
     let prompt = parse_tokens(token_args)?;
@@ -93,9 +93,9 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
     }
 
     let model = Model::load(path)?;
-    eprintln!("greedy-generating up to {max_new} token(s) (cached, multi-threaded)...");
+    eprintln!("greedy-generating up to {max_gen} token(s) (cached, multi-threaded)...");
     let mut sampler = Sampler::greedy();
-    let generated = model.generate(&prompt, &mut sampler, max_new, tokenizer::TOKEN_EOS);
+    let generated = model.generate(&prompt, &mut sampler, max_gen, tokenizer::TOKEN_EOS);
 
     println!("prompt    : {prompt:?}");
     println!("generated : {generated:?}");
@@ -118,7 +118,7 @@ fn cmd_tokenize(path: &str, text_args: &[String]) -> Cmd {
 
 /// Encode text, greedy-generate a continuation, and decode it back to text.
 fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
-    let max_new: usize = max_str
+    let max_gen: usize = max_str
         .parse()
         .map_err(|_| format!("invalid max-new-tokens {max_str:?}"))?;
     let text = text_args.join(" ");
@@ -130,7 +130,7 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
     let tok = Tokenizer::from_gguf(model.gguf())?;
     let prompt = tok.encode(&text, true);
     eprintln!(
-        "prompt = {} tokens; greedy-generating up to {max_new} (cached, multi-threaded)...",
+        "prompt = {} tokens; greedy-generating up to {max_gen} (cached, multi-threaded)...",
         prompt.len()
     );
     println!("prompt       : {text:?}");
@@ -139,7 +139,7 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
 
     // Stream each token's text to stdout as it is generated.
     let mut sampler = Sampler::greedy();
-    let (generated, stats) = model.generate_with_stats(&prompt, &mut sampler, max_new, tok.eos, |t| {
+    let (generated, stats) = model.generate_with_stats(&prompt, &mut sampler, max_gen, tok.eos, |t| {
         print!("{}", tok.decode(&[t]));
         std::io::stdout().flush().ok();
     });
@@ -243,8 +243,8 @@ fn cmd_chat(path: &str, args: &[String]) -> Cmd {
     let model = Model::load(path)?;
     let mut agent = Agent::new(&model)?;
     if let Some(s) = args.first() {
-        let max_new = s.parse().map_err(|_| format!("invalid max-new {s:?}"))?;
-        agent = agent.max_new(max_new);
+        let max_gen = s.parse().map_err(|_| format!("invalid max-new {s:?}"))?;
+        agent = agent.max_gen(max_gen);
     }
     let pal = Palette::detect();
 

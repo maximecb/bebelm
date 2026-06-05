@@ -16,7 +16,7 @@ use crate::tokenizer::{Tokenizer, TOKEN_IM_END};
 
 /// Default per-turn generation cap. A reasoning (`<think>`) turn can run long, so this is
 /// generous; it only bounds a runaway turn.
-const DEFAULT_MAX_NEW: usize = 2048;
+const DEFAULT_MAX_GEN: usize = 2048;
 
 /// Default cap on the transcript length (tokens) the agent will decode up to. The model
 /// supports far more positions; this is a conservative session default.
@@ -30,7 +30,7 @@ const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n";
 pub enum StopReason {
     /// The model emitted the end-of-turn token.
     Eos,
-    /// Hit the per-turn `max_new` cap.
+    /// Hit the per-turn `max_gen` cap.
     MaxNew,
     /// The transcript reached `max_context`.
     ContextFull,
@@ -55,7 +55,7 @@ pub struct Agent<'m> {
     /// The full token transcript (every turn so far). `cache.pos` of these have already been
     /// run through the caches; the remainder is prefilled on the next [`generate`](Self::generate).
     history: Vec<u32>,
-    max_new: usize,
+    max_gen: usize,
     max_context: usize,
 }
 
@@ -70,7 +70,7 @@ impl<'m> Agent<'m> {
             cache: Cache::new(),
             sampler: Sampler::recommended(),
             history: Vec::new(),
-            max_new: DEFAULT_MAX_NEW,
+            max_gen: DEFAULT_MAX_GEN,
             max_context: DEFAULT_MAX_CONTEXT,
         })
     }
@@ -96,8 +96,8 @@ impl<'m> Agent<'m> {
     }
 
     /// Cap the number of tokens generated per turn.
-    pub fn max_new(mut self, n: usize) -> Self {
-        self.max_new = n;
+    pub fn max_gen(mut self, n: usize) -> Self {
+        self.max_gen = n;
         self
     }
 
@@ -144,7 +144,7 @@ impl<'m> Agent<'m> {
     }
 
     /// Prefill any appended-but-unprocessed tokens, then decode a continuation until the model
-    /// emits EOS, hits `max_new`, or fills the context. Visible tokens are appended to the
+    /// emits EOS, hits `max_gen`, or fills the context. Visible tokens are appended to the
     /// transcript and streamed to `on_token`; the terminating EOS is not.
     pub fn generate(&mut self, mut on_token: impl FnMut(u32, &str)) -> Turn {
         // Prefill: run every pending token except the last through the caches; the last token's
@@ -172,7 +172,7 @@ impl<'m> Agent<'m> {
             on_token(next, &text);
             ids.push(next);
             self.history.push(next);
-            if ids.len() >= self.max_new {
+            if ids.len() >= self.max_gen {
                 break StopReason::MaxNew;
             }
             if self.history.len() >= self.max_context {
@@ -193,7 +193,7 @@ impl<'m> Agent<'m> {
     }
 
     /// Clear the conversation (transcript + caches), keeping the loaded weights and config.
-    pub fn reset(&mut self) {
+    pub fn clear(&mut self) {
         self.history.clear();
         self.cache = Cache::new();
     }

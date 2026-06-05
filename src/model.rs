@@ -172,9 +172,9 @@ impl Model {
     }
 
     /// Autoregressive generation with the KV + conv caches. Stops at `eos` or after
-    /// `max_new` tokens. Returns the newly generated token ids (excluding the prompt).
-    pub fn generate(&self, prompt: &[u32], sampler: &mut Sampler, max_new: usize, eos: u32) -> Vec<u32> {
-        self.generate_with_stats(prompt, sampler, max_new, eos, |_| {}).0
+    /// `max_gen` tokens. Returns the newly generated token ids (excluding the prompt).
+    pub fn generate(&self, prompt: &[u32], sampler: &mut Sampler, max_gen: usize, eos: u32) -> Vec<u32> {
+        self.generate_with_stats(prompt, sampler, max_gen, eos, |_| {}).0
     }
 
     /// Like [`generate`](Self::generate) but also returns prefill/decode timing and calls
@@ -183,7 +183,7 @@ impl Model {
         &self,
         prompt: &[u32],
         sampler: &mut Sampler,
-        max_new: usize,
+        max_gen: usize,
         eos: u32,
         mut on_token: impl FnMut(u32),
     ) -> (Vec<u32>, GenStats) {
@@ -201,8 +201,8 @@ impl Model {
 
         // Decode: sample, then compute the next logits (skip that on the final token).
         let t_decode = Instant::now();
-        let mut generated = Vec::with_capacity(max_new);
-        for i in 0..max_new {
+        let mut generated = Vec::with_capacity(max_gen);
+        for i in 0..max_gen {
             let next = sampler.sample(&mut logits, &history);
             generated.push(next);
             history.push(next);
@@ -210,7 +210,7 @@ impl Model {
             if next == eos {
                 break;
             }
-            if i + 1 < max_new {
+            if i + 1 < max_gen {
                 logits = self.forward_step(next, &mut cache);
             }
         }
