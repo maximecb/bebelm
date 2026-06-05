@@ -1,10 +1,12 @@
-# Build the x86 SIMD kernels with AVX2 + FMA. The default x86_64 baseline is SSE2-only, so
-# `wide`'s f32x8 compiles to two 128-bit ops — half the SIMD width on any AVX2 CPU (e.g. the
-# i5-6500T target). `x86-64-v3` is the "Haswell, 2013+" microarchitecture level (AVX2, FMA,
-# BMI); the binary then requires such a CPU. Scoped to x86_64 so the arm64/NEON build (which
-# already has 128-bit SIMD and no AVX) is untouched.
+# Tune the x86 SIMD kernels for the CPU you build on: `target-cpu=native` detects the build
+# host's features, so it uses AVX2 + FMA when present (e.g. the i5-6500T target) and quietly
+# falls back to whatever the machine supports otherwise. The default x86_64 baseline is
+# SSE2-only, where `wide`'s f32x8 compiles to two 128-bit ops — half the width. Scoped to
+# x86_64 so the arm64/NEON build (already 128-bit, no AVX) is untouched.
 #
-# To instead optimize for whatever CPU you build on (also picks up e.g. AVX-512, but isn't
-# reproducible across machines), use ["-C", "target-cpu=native"].
+# `native` bakes in the build host's ISA, so the binary may fault on an older CPU. To build a
+# portable binary, override via RUSTFLAGS (it takes precedence over this file) — see README:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" ...  # AVX2 baseline (Haswell, 2013+)
+#   RUSTFLAGS="-C target-cpu=x86-64"    ...  # universal SSE2 baseline
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=native"]

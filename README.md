@@ -8,11 +8,25 @@ This is a library crate so the model can be imported.
 
 In order to run, the weights GGUF file needs to be downloaded first (5.2GB).
 
-### CPU requirements
+### CPU / SIMD build
 
-The SIMD kernels are built for AVX2 + FMA on x86 (the `x86-64-v3` level, i.e. Intel Haswell /
-2013 and newer) via `.cargo/config.toml` — without it the default x86_64 target is SSE2-only
-and runs the vector dot products at half width. A pre-AVX2 x86 CPU will fault; either build
-for the baseline (`target-cpu=x86-64`) or, to tune for the exact machine you build on, use
-`target-cpu=native`. arm64 (Apple Silicon / NEON) is unaffected and needs no flags.
+The x86 SIMD kernels are tuned for the machine you build on: `.cargo/config.toml` sets
+`target-cpu=native`, so a build automatically uses **AVX2 + FMA** when the CPU has them
+and falls back to whatever it supports otherwise. (Without this the default
+x86_64 target is SSE2-only and runs the vector dot products at half width.) arm64 (Apple
+Silicon / NEON) is unaffected and needs no flags.
 
+Because `native` targets the build host, a binary built on an AVX2 machine may fault on an
+older CPU. To build a portable binary, override the CPU target via `RUSTFLAGS` (it takes
+precedence over `.cargo/config.toml`):
+
+```sh
+# AVX2 baseline — runs on any Haswell (2013) or newer x86:
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+
+# Universal baseline — runs on any x86_64 (SSE2 only, slowest):
+RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
+```
+
+The instruction set is chosen at build time; there is no single binary that switches at
+runtime.
