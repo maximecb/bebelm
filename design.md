@@ -334,10 +334,12 @@ Pure Rust, no system packages. Each justified; minimal tree.
 | `memmap2` | core | mmap the ~5 GB GGUF: lazy paging, shared page cache, no 5 GB upfront read+alloc | None — pure-Rust FFI to system libc; nothing to install. |
 | `rayon` | phase 2 (opt 9c) | data-parallel matmul rows / per-expert / per-head work across cores | None — built on std threads. |
 | `wide` | phase 2 (opt 9d) | cross-platform portable SIMD (`f32x8`) for dot/dequant; compiles to SSE/AVX2/NEON | None — pure Rust, no nightly. |
+| `bytemuck` | phase 2 (opt 9h/9k) | zero-copy reinterpret between same-size POD SIMD vectors (split/bit-cast in the quant kernels); already transitive via `wide`. *Declared but not yet referenced* — kept for the int-dot / unpack work. | None — pure Rust. |
 
 > `half` was **dropped**: the file has no F16/BF16 whole tensors, so we only need f16→f32
 > for in-block scales — hand-rolled as a tested ~25-line `f16_to_f32` in
-> `kernels/dequant.rs`. Current dependency tree: `memmap2`, `rayon`, `wide`.
+> `kernels/dequant.rs`. Current dependency tree: `memmap2`, `rayon`, `wide`, `bytemuck`
+> (the last already pulled in transitively by `wide`).
 
 **Deliberately NOT taking crates for:**
 
@@ -405,12 +407,18 @@ src/
    pre-tokenizer (no `regex`), GPT-2 byte↔char table, merges. Round-trips on the real
    vocab. **Correctness gate PASSED:** `bebelm complete … "The capital of France is"` →
    " the city of Paris" (fluent + factually correct), validating the whole pipeline.
-9. **Optimizations** (sub-items 9a–9h in the *Optimizations* section above; ordered
+9. **Optimizations** (sub-items 9a–9l in the *Optimizations* section above; ordered
    easiest-first with impact estimates). Baseline already has MoE sparsity + caches;
-   **9a–9e done**: `rayon` row-parallel `matvec` (9c) + `wide` `f32x8` SIMD dot fused with
-   per-block Q4_K + Q6_K dequant (9d/9e) now reach **~15.0 tok/s decode / ~16.4 prefill**
-   (~17× over the 0.87 single-core baseline). Suggested next: 9f (long prompts), 9g (long
-   contexts), 9h (int8 dot — supersedes the f32 dequant hot path).
+   **9a–9e + 9i (MoE expert batching) + 9j (AVX2 build) done** — now **~16 tok/s decode /
+   ~17–19 prefill** on the M5 MacBook Air (~18× over the 0.87 single-core baseline).
+   Profiling (`profile.sh`) shows decode is **compute-bound**: ~82% of samples sit in the
+   quantized dot kernels (Q4_K `nibble_dot32`/`dot_q4k_block`, Q6_K `dot_q6k_block`), ~18%
+   in fork/join idle, and only ~11% of the M5's 153 GB/s is used (~1.1 GB active weights/
+   token × ~16 tok/s ≈ 17 GB/s). So decode is compute-bound, but *not* on the unpack: the
+   **9k** experiment (vectorizing the K-quant unpack) was bit-identical yet ~neutral on M5,
+   so the dot kernels are bound by the fixed per-8-weight f32 FMA + load throughput, not the
+   sub-byte unpack. The real compute lever is therefore **9h** (integer dot). Remaining:
+   9h, plus 9f (long prompts) / 9g (long contexts); 9k/9l deprioritized on M5.
   - llama.cpp has a custom GEMM (matrix multiply) and MoE routing kernels tuned for
     hybrid (convolution + attention) architecture. We could potentially take inspiration
     from this, but we should probably start by profiling our current kernels.
@@ -438,10 +446,15 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | **9f** | **Batched GEMM prefill** — dequantize each weight row once and apply to all prompt tokens at once (vs. once per token). | moderate | prefill only: ≈ prompt-length×; no decode effect |
 | **9g** | **f16 KV cache** — store K/V as f16 to halve attention memory bandwidth. | easy–moderate | small now; grows with context length |
 | **9h** | **Q8 activation + integer block dot** (llama.cpp `vec_dot`) — *per-matmul*, quantize the **input vector** to Q8_K (activations stay f32 everywhere else) and dot in the integer domain directly against the Q4_K/Q6_K quants; no f32 weight dequant. Supersedes 9d/9e on the hot path. See notes. | hard | **HIGH ~2–4×**, most complex |
+| **9i ✅** | **Batch MoE expert matvecs** — run all selected experts' gate+up rows (then all down rows) as one parallel region (`matvec_fused_batch`) instead of 12 separate fork/joins per MoE layer. | easy | **measured ~+18% decode** (13.7→~16 tok/s); fewer fork/join barriers → better core saturation |
+| **9j ✅** | **AVX2 + FMA on x86** — `.cargo/config.toml` sets `target-cpu=native`; the default x86_64 baseline is SSE2-only, so `wide`'s `f32x8` ran at half width. Scoped to x86_64 (arm64/NEON untouched). | trivial | x86 target only (not yet measured on the i5); arm64 unchanged |
+| **9k ⚠️** | **Vectorize the K-quant unpack** — replace the per-lane scalar gather in `nibble_dot32` with in-vector `wide` widening (`u8x16 → i16x16 → i32x8 → round_float → f32x8`, split via `bytemuck::cast`). **Tried on `nibble_dot32`: bit-identical, but measured ~neutral on M5 (≤4%, within noise) → reverted.** The unpack isn't the dot's bottleneck (the fixed f32 FMA/load throughput is). May still pay off on x86/AVX2 (untested), where the scalar gather likely costs more. See notes. | moderate | **~0 on M5** (NEON); possibly positive on AVX2 |
+| **9l** | **Multi-row register blocking in `matvec`** — compute 2–4 output rows per pass, reusing the `x` loads and amortizing loop/reduce overhead. Portable. | moderate | est. modest; helps the compute fraction only |
 
-Suggested order: **9a, 9b** (quick), then **9c** (biggest single win), then **9d/9e**
-(SIMD + fusion, both Q4_K and Q6_K) — **all done**. Remaining: 9f for long prompts, 9g for
-long contexts, 9h last (largest rewrite).
+Suggested order: **9a–9e + 9i + 9j done**. Next: **9k** (vectorize the unpack — the
+compute-bound hot path), then **9l**; **9f** for long prompts, **9g** for long contexts, **9h**
+last (largest rewrite; supersedes 9d/9e/9k on the hot path). Further fork/join trimming beyond
+9i was tried (batching q/k/v + dense gate/up) and measured **neutral**, so it's deprioritized.
 
 ### Notes on selected sub-items
 
@@ -468,6 +481,19 @@ YMM register); on arm64 NEON (128-bit = 4×f32) it lowers to 2× `f32x4`. `f32x1
 AVX-512 (512-bit) — not present on this machine and not provided by `wide`. To exceed
 8-wide throughput, use **multiple independent `f32x8` accumulators** to hide FMA latency,
 not wider lanes.
+
+**9k — portable SIMD unpack (tried, ~neutral on M5).** `wide` 0.7.33 *does* provide the
+widening conversions (`From<u8x16> for i16x16`, `From<i16x8> for i32x8`, `i32x8::round_float()
+-> f32x8`), so the sub-byte → f32 expansion can stay in-vector: per 16 weights, `u8x16 →
+i16x16`, mask/shift the nibble (`& 0x0f`, `>> 4 & 0x0f`), split into two `i16x8` (`bytemuck::
+cast`, no memory round-trip), `→ i32x8 → round_float → f32x8`, then the existing `mul_add`.
+Keeping lane order identical makes it **bit-identical** (no `EXPECTED_IDS` change). **But** an
+implementation on `nibble_dot32` measured **~neutral on M5** (≤4%, within run-to-run noise),
+with both the `to_array` and `bytemuck` splits — so the split wasn't the issue; the unpack
+simply isn't the bottleneck inside the dot (the per-8-weight f32 FMA + weight/`x` loads are,
+and those are unchanged). Reverted. The same kernel on x86/AVX2 (the i5 target) is untested and
+*might* benefit — the scalar→vector gather (`f32x8::from([f32;8])`) and `vpmovzxbw` widening
+have a different cost balance there. If revisited, measure on the i5 specifically.
 
 **9h — what it implies.** *Not* a global switch to Q8 activations; the residual stream,
 norms, attention, etc. stay f32. Per matmul: (1) quantize just the input vector `x` to

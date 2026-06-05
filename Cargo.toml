@@ -17,6 +17,11 @@ rayon = "1"
 # core::arch compiler intrinsics — no nightly, no system package, no C toolchain.
 wide = "0.7"
 
+# Zero-copy reinterpret between same-size POD types (e.g. splitting/bit-casting `wide` SIMD
+# vectors in the quant kernels). Pure Rust; already in the tree via `wide`. Currently unused —
+# kept declared for the upcoming int-dot / SIMD-unpack work.
+bytemuck = "1"
+
 # Fully optimize the dependencies in debug mode
 [profile.dev.package."*"]
 opt-level = 3
