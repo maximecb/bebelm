@@ -1,11 +1,11 @@
 //! bebelm — CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M).
 //!
-//! CLI over the `bebelm` library: tokenize text, run the forward pass, and greedily
-//! generate / complete. The weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the
-//! command line.
+//! CLI over the `bebelm` library: tokenize text, run the forward pass, greedily
+//! generate / complete, or hold an interactive `chat`. The weights file is taken from
+//! `$BEBELM_WEIGHTS_FILE`, not the command line.
 
 use std::error::Error;
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 /// Default weights path when `$BEBELM_WEIGHTS_FILE` is unset (relative to the cwd).
@@ -39,6 +39,7 @@ fn main() -> ExitCode {
             Some(max) => cmd_complete(&path, max, &args[3..]),
             None => return usage("complete <max-new-tokens> <text>..."),
         },
+        Some("chat") => cmd_chat(&path, &args[2..]),
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
             eprintln!("  bebelm generate <max-new> <token>... greedy-generate token ids");
             eprintln!("  bebelm tokenize <text>...            encode/decode round-trip");
             eprintln!("  bebelm complete <max-new> <text>...  greedy text completion");
+            eprintln!("  bebelm chat     [max-new]            interactive chat (streams thinking + reply)");
             eprintln!("\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})");
             return ExitCode::FAILURE;
         }
@@ -201,5 +203,99 @@ fn cmd_logits(path: &str, token_args: &[String]) -> Cmd {
     for &i in idx.iter().take(5) {
         println!("  token {i:>6}  logit {:.4}", logits[i]);
     }
+    Ok(())
+}
+
+/// ANSI colors for the chat UI, blanked when stdout is not a terminal (e.g. piped to a file).
+struct Palette {
+    user: &'static str,
+    model: &'static str,
+    dim: &'static str,
+    reset: &'static str,
+}
+
+impl Palette {
+    fn detect() -> Self {
+        if io::stdout().is_terminal() {
+            Palette { user: "\x1b[1;32m", model: "\x1b[36m", dim: "\x1b[2m", reset: "\x1b[0m" }
+        } else {
+            Palette { user: "", model: "", dim: "", reset: "" }
+        }
+    }
+}
+
+/// Default per-turn generation cap. A reasoning turn (the `<think>` block) can run long, so
+/// this is generous; it only bounds a runaway turn. Override with `bebelm chat <max-new>`.
+const CHAT_MAX_NEW: usize = 2048;
+
+/// Interactive multi-turn chat. Builds a ChatML transcript of token ids and regenerates from
+/// the whole conversation each turn (simple — no cross-turn KV-cache reuse yet). The model's
+/// full output, including the `<think>…</think>` reasoning, is streamed in a distinct color;
+/// only the terminating `<|im_end|>` is suppressed. Decoding is greedy and there is no system
+/// prompt; prior assistant turns are kept verbatim (reasoning included) in the context.
+fn cmd_chat(path: &str, args: &[String]) -> Cmd {
+    let max_new: usize = match args.first() {
+        Some(s) => s.parse().map_err(|_| format!("invalid max-new {s:?}"))?,
+        None => CHAT_MAX_NEW,
+    };
+
+    let model = Model::load(path)?;
+    let tok = Tokenizer::from_gguf(model.gguf())?;
+    let pal = Palette::detect();
+    let eos = tok.eos;
+
+    eprintln!("Chat ready. Type a message. Input Ctrl-D or /exit to quit.\n");
+
+    let mut convo: Vec<u32> = Vec::new();
+    let mut sampler = Sampler::greedy();
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        print!("{}User>{} ", pal.user, pal.reset);
+        io::stdout().flush().ok();
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            println!(); // terminate the prompt line on Ctrl-D
+            break;
+        }
+        let msg = line.trim();
+        if msg.is_empty() {
+            continue;
+        }
+        if msg == "/exit" || msg == "/quit" {
+            break;
+        }
+
+        // Append this user turn + the assistant opener. The model emits its own `<think>`
+        // after the opener, so we don't force it. Each prior turn ends at the assistant's
+        // `<|im_end|>`, so turns after the first start with the separating newline. BOS is
+        // prepended only on the very first segment.
+        let first = convo.is_empty();
+        let lead = if first { "" } else { "\n" };
+        let seg = format!("{lead}<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n");
+        convo.extend(tok.encode(&seg, first));
+
+        // Stream the reply (all but the terminating <|im_end|>) in the model color.
+        print!("{}", pal.model);
+        io::stdout().flush().ok();
+        let (generated, stats) = model.generate_with_stats(&convo, &mut sampler, max_new, eos, |t| {
+            if t != eos {
+                print!("{}", tok.decode(&[t]));
+                io::stdout().flush().ok();
+            }
+        });
+        println!("{}", pal.reset);
+        println!(
+            "{}({} tok, {:.1} tok/s){}",
+            pal.dim,
+            stats.generated_tokens,
+            stats.decode_tps(),
+            pal.reset
+        );
+
+        convo.extend(generated);
+    }
+
     Ok(())
 }
