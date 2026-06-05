@@ -12,7 +12,9 @@ use std::time::Instant;
 use crate::cache::Cache;
 use crate::model::{GenStats, Model};
 use crate::sampler::Sampler;
-use crate::tokenizer::{Tokenizer, TOKEN_IM_END};
+use crate::tokenizer::{
+    Tokenizer, TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD,
+};
 
 /// Default per-turn generation cap. A reasoning (`<think>`) turn can run long, so this is
 /// generous; it only bounds a runaway turn.
@@ -25,10 +27,17 @@ const DEFAULT_MAX_CONTEXT: usize = 32_768;
 /// Text appended to open an assistant turn before generating its reply.
 const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n";
 
+/// Control tokens that end a turn if the model emits one as "content". Besides the normal
+/// end-of-turn `<|im_end|>` (the EOS), a *sampled* turn can occasionally land on a document /
+/// turn-boundary token — `<|endoftext|>`, `<|startoftext|>`, `<|pad|>`, or a stray
+/// `<|im_start|>`. None is ever valid reply content, and decoding past one sends the model off
+/// the rails, so we stop the turn at the first such token (as we do for EOS).
+const STOP_TOKENS: [u32; 4] = [TOKEN_ENDOFTEXT, TOKEN_BOS, TOKEN_PAD, TOKEN_IM_START];
+
 /// Why [`Agent::generate`] stopped decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// The model emitted the end-of-turn token.
+    /// The model emitted an end-of-turn (or other sequence-boundary) token.
     Eos,
     /// Hit the per-turn `max_gen` cap.
     MaxNew,
@@ -165,7 +174,7 @@ impl<'m> Agent<'m> {
         let mut ids = Vec::new();
         let stop = loop {
             let next = self.sampler.sample(&mut logits, &self.history);
-            if next == self.tok.eos {
+            if next == self.tok.eos || STOP_TOKENS.contains(&next) {
                 break StopReason::Eos;
             }
             let text = self.tok.decode(&[next]);

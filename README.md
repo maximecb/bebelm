@@ -46,10 +46,10 @@ weights from `BEBELM_WEIGHTS_FILE` (see above).
   caches persist across turns, so each message only prefills its own new tokens. Sampling uses
   the model's recommended defaults. `max-new` caps the tokens generated per turn (default 2048).
   `Ctrl-D` or `/exit` to quit.
-- **`complete <max-new> <text>…`** — greedy text completion of a prompt; streams tokens as they
+- **`complete <max-gen> <text>…`** — greedy text completion of a prompt; streams tokens as they
   are produced and reports prefill/decode throughput.
 - **`tokenize <text>…`** — encode text to token ids and decode it back (a vocab round-trip check).
-- **`generate <max-new> <token-id>…`** — greedy-generate from raw prompt token ids.
+- **`generate <max-gen> <token-id>…`** — greedy-generate from raw prompt token ids.
 - **`logits <token-id>…`** — run one forward pass on raw token ids and print a summary of the
   next-token logits (argmax + top-5).
 

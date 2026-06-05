@@ -16,11 +16,14 @@ pub struct Sampler {
     /// Divide already-seen tokens' logits by this (`1.0` ⇒ disabled).
     pub repeat_penalty: f32,
     rng: u64,
+    /// Reused scratch buffer of candidate indices for top-k, so each call doesn't allocate a
+    /// fresh vocab-sized `Vec`.
+    cand: Vec<usize>,
 }
 
 impl Sampler {
     pub fn new(temperature: f32, top_k: usize, repeat_penalty: f32, seed: u64) -> Self {
-        Self { temperature, top_k, repeat_penalty, rng: seed | 1 }
+        Self { temperature, top_k, repeat_penalty, rng: seed | 1, cand: Vec::new() }
     }
 
     /// Deterministic greedy decoding (argmax, no penalty).
@@ -49,17 +52,21 @@ impl Sampler {
             return argmax(logits) as u32;
         }
 
-        // Candidate set = the top-k logits (or all of them).
+        // Candidate set = the top-k logits (or all of them). Reuse the scratch index buffer so
+        // each call doesn't allocate a fresh vocab-sized Vec; `select_nth_unstable_by` already
+        // only partitions around the k-th element rather than fully sorting.
         let k = if self.top_k == 0 { logits.len() } else { self.top_k.min(logits.len()) };
-        let mut cand: Vec<usize> = (0..logits.len()).collect();
-        if k < cand.len() {
-            cand.select_nth_unstable_by(k - 1, |&a, &b| logits[b].total_cmp(&logits[a]));
-            cand.truncate(k);
+        self.cand.clear();
+        self.cand.extend(0..logits.len());
+        if k < self.cand.len() {
+            self.cand.select_nth_unstable_by(k - 1, |&a, &b| logits[b].total_cmp(&logits[a]));
+            self.cand.truncate(k);
         }
 
         // Temperature-scaled softmax over the candidates.
-        let max = cand.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
-        let probs: Vec<f32> = cand
+        let max = self.cand.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
+        let probs: Vec<f32> = self
+            .cand
             .iter()
             .map(|&i| ((logits[i] - max) / self.temperature).exp())
             .collect();
@@ -71,10 +78,10 @@ impl Sampler {
         for (j, &p) in probs.iter().enumerate() {
             acc += p;
             if r < acc {
-                return cand[j] as u32;
+                return self.cand[j] as u32;
             }
         }
-        cand[cand.len() - 1] as u32
+        self.cand[self.cand.len() - 1] as u32
     }
 
     fn next_u64(&mut self) -> u64 {
