@@ -46,7 +46,7 @@ quality-sensitive tensors (typically the token-embedding/output matrix, the atte
 gains, the MoE router, expert biases) are stored as **F32**. Our loader must therefore
 dispatch on the per-tensor dtype recorded in the GGUF header.
 
-> ✅ Done (milestone 1): `bebelm dump` confirmed the file has 256 tensors with the
+> ✅ Done (milestone 1): inspecting the file confirmed it has 256 tensors with the
 > Q4_K/Q6_K/F32 mix and the tensor names recorded in the verified mapping below.
 
 ---
@@ -383,15 +383,14 @@ src/
    confirmed the Q4_K/Q6_K/F32 mix and the verified tensor-name mapping above.
 2. ✅ **Dequant kernels** (`kernels/dequant.rs`): hand-rolled `f16_to_f32`, Q4_K + Q6_K
    block decoders (exact ggml reference) + an F32/F16/Q4_K/Q6_K dispatcher. Unit-tested on
-   synthetic blocks and validated on real tensors via `bebelm dequant <tensor>` (the GGUF
-   path comes from `$BEBELM_WEIGHTS_FILE`).
+   synthetic blocks and validated on real tensors from the GGUF.
 3. ✅ **Quantized GEMV + RMSNorm** (`kernels/matmul.rs`, `kernels/rmsnorm.rs`):
    `matvec(dtype, W, n_in, n_out, x, y)` (dequantize-row-then-dot, reused buffer) and
    `rmsnorm(x, gain, eps, out)`. Unit-tested on hand-computed cases (incl. row-major
    layout check). Also restructured into a lib crate + thin bin (clean dead-code story).
 4. ✅ **Config + model loading** (`config.rs`, `model.rs`): architecture as hardcoded
    `const`s + `validate(&gguf)`; `Model::load` resolves all 256 tensors by name and
-   checks shapes. `bebelm load` confirmed it against the real file. (We chose a **static
+   checks shapes, confirmed against the real file. (We chose a **static
    forward pass** — see note below — rather than runtime config interpretation.)
 5. ✅ **Remaining kernels + single forward pass** (no cache): `rope`, `softmax`,
    `activation` (SiLU/SwiGLU), `elementwise`, `conv`, `attention`; wired the static layer
