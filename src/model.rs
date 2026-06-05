@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use crate::config::{
     self, CONV_L_CACHE, DENSE_FF, HEAD_DIM, HIDDEN, KV_DIM, MOE_FF, N_EXPERTS, N_EXPERTS_USED,
@@ -20,28 +19,7 @@ use crate::kernels::elementwise::{add_assign, add_scaled};
 use crate::kernels::matmul::{matvec, matvec_fused_batch, FusedJob};
 use crate::kernels::rmsnorm::rmsnorm;
 use crate::kernels::rope::rope_neox;
-use crate::sampler::Sampler;
 use crate::tensor::GgmlType;
-
-/// Timing + counts from a generation run.
-pub struct GenStats {
-    pub prompt_tokens: usize,
-    pub generated_tokens: usize,
-    pub prefill: Duration,
-    pub decode: Duration,
-}
-
-impl GenStats {
-    /// Prefill throughput (prompt tokens per second).
-    pub fn prefill_tps(&self) -> f64 {
-        self.prompt_tokens as f64 / self.prefill.as_secs_f64().max(f64::MIN_POSITIVE)
-    }
-
-    /// Decode throughput (generated tokens per second).
-    pub fn decode_tps(&self) -> f64 {
-        self.generated_tokens as f64 / self.decode.as_secs_f64().max(f64::MIN_POSITIVE)
-    }
-}
 
 /// A loaded, validated model: the mmapped GGUF plus a name → tensor index, plus the small
 /// F32 tensors (norm gains, conv filters, expert biases) pre-dequantized once (9b).
@@ -169,60 +147,6 @@ impl Model {
         let mut logits = vec![0.0f32; VOCAB];
         matvec(tok_embd.ggml_type, self.data(tok_embd), HIDDEN, VOCAB, &normed, &mut logits);
         logits
-    }
-
-    /// Autoregressive generation with the KV + conv caches. Stops at `eos` or after
-    /// `max_gen` tokens. Returns the newly generated token ids (excluding the prompt).
-    pub fn generate(&self, prompt: &[u32], sampler: &mut Sampler, max_gen: usize, eos: u32) -> Vec<u32> {
-        self.generate_with_stats(prompt, sampler, max_gen, eos, |_| {}).0
-    }
-
-    /// Like [`generate`](Self::generate) but also returns prefill/decode timing and calls
-    /// `on_token` with each token as it is produced (for streaming output).
-    pub fn generate_with_stats(
-        &self,
-        prompt: &[u32],
-        sampler: &mut Sampler,
-        max_gen: usize,
-        eos: u32,
-        mut on_token: impl FnMut(u32),
-    ) -> (Vec<u32>, GenStats) {
-        let mut cache = Cache::new();
-        let mut history = prompt.to_vec();
-
-        // Prefill: only the last prompt token needs logits (9a); the rest just fill caches.
-        let t_prefill = Instant::now();
-        let (last, rest) = prompt.split_last().expect("generate: empty prompt");
-        for &tok in rest {
-            self.run_layers(tok, &mut cache);
-        }
-        let mut logits = self.forward_step(*last, &mut cache);
-        let prefill = t_prefill.elapsed();
-
-        // Decode: sample, then compute the next logits (skip that on the final token).
-        let t_decode = Instant::now();
-        let mut generated = Vec::with_capacity(max_gen);
-        for i in 0..max_gen {
-            let next = sampler.sample(&mut logits, &history);
-            generated.push(next);
-            history.push(next);
-            on_token(next);
-            if next == eos {
-                break;
-            }
-            if i + 1 < max_gen {
-                logits = self.forward_step(next, &mut cache);
-            }
-        }
-        let decode = t_decode.elapsed();
-
-        let stats = GenStats {
-            prompt_tokens: prompt.len(),
-            generated_tokens: generated.len(),
-            prefill,
-            decode,
-        };
-        (generated, stats)
     }
 
     /// Embedding lookup: dequantize row `token` of token_embd into `out` (`HIDDEN`).

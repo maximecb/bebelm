@@ -21,7 +21,6 @@ use bebelm::agent::Agent;
 use bebelm::config;
 use bebelm::gguf::GgufFile;
 use bebelm::model::Model;
-use bebelm::sampler::Sampler;
 use bebelm::tokenizer::{self, Tokenizer};
 
 type Cmd = Result<(), Box<dyn Error>>;
@@ -94,11 +93,12 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
 
     let model = Model::load(path)?;
     eprintln!("greedy-generating up to {max_gen} token(s) (cached, multi-threaded)...");
-    let mut sampler = Sampler::greedy();
-    let generated = model.generate(&prompt, &mut sampler, max_gen, tokenizer::TOKEN_EOS);
+    let mut agent = Agent::new(&model)?.greedy().max_gen(max_gen);
+    agent.append_tokens(&prompt);
+    let turn = agent.generate(|_, _| {});
 
     println!("prompt    : {prompt:?}");
-    println!("generated : {generated:?}");
+    println!("generated : {:?}", turn.ids);
     Ok(())
 }
 
@@ -127,8 +127,10 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
     }
 
     let model = Model::load(path)?;
-    let tok = Tokenizer::from_gguf(model.gguf())?;
-    let prompt = tok.encode(&text, true);
+    // Greedy, deterministic decoding so the continuation is reproducible.
+    let mut agent = Agent::new(&model)?.greedy().max_gen(max_gen);
+    agent.append(&text);
+    let prompt = agent.history().to_vec();
     eprintln!(
         "prompt = {} tokens; greedy-generating up to {max_gen} (cached, multi-threaded)...",
         prompt.len()
@@ -138,26 +140,25 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
     std::io::stdout().flush().ok();
 
     // Stream each token's text to stdout as it is generated.
-    let mut sampler = Sampler::greedy();
-    let (generated, stats) = model.generate_with_stats(&prompt, &mut sampler, max_gen, tok.eos, |t| {
-        print!("{}", tok.decode(&[t]));
+    let turn = agent.generate(|_id, piece| {
+        print!("{piece}");
         std::io::stdout().flush().ok();
     });
     println!(); // end the streamed line
 
     println!("prompt ids   : {prompt:?}");
-    println!("gen ids      : {generated:?}");
+    println!("gen ids      : {:?}", turn.ids);
     println!(
         "prefill      : {} tok in {:.0} ms ({:.1} tok/s)",
-        stats.prompt_tokens,
-        stats.prefill.as_secs_f64() * 1e3,
-        stats.prefill_tps()
+        turn.stats.prompt_tokens,
+        turn.stats.prefill.as_secs_f64() * 1e3,
+        turn.stats.prefill_tps()
     );
     println!(
         "decode       : {} tok in {:.0} ms ({:.2} tok/s)",
-        stats.generated_tokens,
-        stats.decode.as_secs_f64() * 1e3,
-        stats.decode_tps()
+        turn.stats.generated_tokens,
+        turn.stats.decode.as_secs_f64() * 1e3,
+        turn.stats.decode_tps()
     );
     Ok(())
 }

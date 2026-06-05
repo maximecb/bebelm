@@ -7,10 +7,10 @@
 //! wraps the ChatML assistant framing around a single `generate`.
 
 use std::error::Error;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cache::Cache;
-use crate::model::{GenStats, Model};
+use crate::model::Model;
 use crate::sampler::Sampler;
 use crate::tokenizer::{
     Tokenizer, TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD,
@@ -43,6 +43,26 @@ pub enum StopReason {
     MaxNew,
     /// The transcript reached `max_context`.
     ContextFull,
+}
+
+/// Timing + counts from a generation run.
+pub struct GenStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prefill: Duration,
+    pub decode: Duration,
+}
+
+impl GenStats {
+    /// Prefill throughput (prompt tokens per second).
+    pub fn prefill_tps(&self) -> f64 {
+        self.prompt_tokens as f64 / self.prefill.as_secs_f64().max(f64::MIN_POSITIVE)
+    }
+
+    /// Decode throughput (generated tokens per second).
+    pub fn decode_tps(&self) -> f64 {
+        self.generated_tokens as f64 / self.decode.as_secs_f64().max(f64::MIN_POSITIVE)
+    }
 }
 
 /// One generated reply: the new token ids, their decoded text, timing, and why decoding stopped.
@@ -85,6 +105,12 @@ impl<'m> Agent<'m> {
     }
 
     // --- Builder-style configuration ---
+
+    /// Switch to deterministic greedy decoding (argmax; no temperature, top-k, or penalty).
+    pub fn greedy(mut self) -> Self {
+        self.sampler = Sampler::greedy();
+        self
+    }
 
     /// Set the sampling temperature (`0.0` ⇒ greedy argmax).
     pub fn temperature(mut self, t: f32) -> Self {
