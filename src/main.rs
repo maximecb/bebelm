@@ -1,7 +1,8 @@
 //! bebelm — CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M).
 //!
-//! CLI over the `bebelm` library: greedily `complete` a prompt, or hold an interactive
-//! `chat`. The weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the command line.
+//! CLI over the `bebelm` library: `generate` a completion from a prompt, or hold an
+//! interactive `chat`. The weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the
+//! command line.
 
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
@@ -26,16 +27,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let path = weights_path();
     let result: Cmd = match args.get(1).map(String::as_str) {
-        Some("complete") => match args.get(2) {
-            Some(max) => cmd_complete(&path, max, &args[3..]),
-            None => return usage("complete <max-new-tokens> <text>..."),
-        },
+        Some("generate") => cmd_generate(&path, &args[2..]),
         Some("chat") => cmd_chat(&path, &args[2..]),
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
-            eprintln!("  bebelm complete <max-new> <text>...  greedy text completion");
-            eprintln!("  bebelm chat     [max-new]            interactive chat (streams thinking + reply)");
+            eprintln!("  bebelm generate [opts] <prompt>...   text completion of a prompt");
+            eprintln!("  bebelm chat     [opts]               interactive chat (streams thinking + reply)");
+            eprintln!("\n  opts (both): --greedy  --max-gen N  --max-think N  --no-think");
             eprintln!("\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})");
             return ExitCode::FAILURE;
         }
@@ -49,30 +48,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn usage(line: &str) -> ExitCode {
-    eprintln!("usage: bebelm {line}");
-    ExitCode::FAILURE
-}
-
-/// Encode text, greedy-generate a continuation, and decode it back to text.
-fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
-    let max_gen: usize = max_str
-        .parse()
-        .map_err(|_| format!("invalid max-new-tokens {max_str:?}"))?;
-    let text = text_args.join(" ");
+/// Encode a prompt, generate a continuation, and stream it back as text.
+fn cmd_generate(path: &str, args: &[String]) -> Cmd {
+    let (opts, positional) = parse_agent_options(args)?;
+    let text = positional.join(" ");
     if text.is_empty() {
         return Err("need a prompt".into());
     }
 
     let model = Model::load(path)?;
-    // Greedy, deterministic decoding so the continuation is reproducible.
-    let mut agent = Agent::new(&model)?.greedy().max_gen(max_gen);
+    let mut agent = opts.apply(Agent::new(&model)?);
     agent.append(&text);
     let prompt = agent.history().to_vec();
-    eprintln!(
-        "prompt = {} tokens; greedy-generating up to {max_gen} (cached, multi-threaded)...",
-        prompt.len()
-    );
+    eprintln!("prompt = {} tokens; generating (cached, multi-threaded)...", prompt.len());
     println!("prompt       : {text:?}");
     print!("continuation : ");
     std::io::stdout().flush().ok();
@@ -128,18 +116,69 @@ impl Palette {
     }
 }
 
+/// Generation options shared by `generate` and `chat`, parsed from command-line flags.
+#[derive(Default)]
+struct AgentOptions {
+    max_gen: Option<usize>,
+    /// Reasoning-token budget; `Some(0)` for `--no-think`.
+    max_think: Option<usize>,
+    greedy: bool,
+}
+
+impl AgentOptions {
+    /// Apply the parsed options on top of a freshly built agent.
+    fn apply<'m>(self, mut agent: Agent<'m>) -> Agent<'m> {
+        if self.greedy {
+            agent = agent.greedy();
+        }
+        if let Some(n) = self.max_gen {
+            agent = agent.max_gen(n);
+        }
+        if let Some(n) = self.max_think {
+            agent = agent.max_think(n);
+        }
+        agent
+    }
+}
+
+/// Parse the shared agent flags (`--greedy`, `--no-think`, `--max-gen N`, `--max-think N`),
+/// returning the options plus any leftover positional arguments (e.g. a prompt).
+fn parse_agent_options(args: &[String]) -> Result<(AgentOptions, Vec<String>), Box<dyn Error>> {
+    let mut opts = AgentOptions::default();
+    let mut positional = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--greedy" => opts.greedy = true,
+            "--no-think" => opts.max_think = Some(0),
+            "--max-gen" => {
+                let v = it.next().ok_or("--max-gen needs a value")?;
+                opts.max_gen = Some(v.parse().map_err(|_| format!("invalid --max-gen {v:?}"))?);
+            }
+            "--max-think" => {
+                let v = it.next().ok_or("--max-think needs a value")?;
+                opts.max_think = Some(v.parse().map_err(|_| format!("invalid --max-think {v:?}"))?);
+            }
+            s if s.starts_with("--") => return Err(format!("unknown option {s:?}").into()),
+            _ => positional.push(arg.clone()),
+        }
+    }
+    Ok((opts, positional))
+}
+
 /// Interactive multi-turn chat. Keeps one [`Agent`] alive across turns, so each message only
 /// prefills its own newly appended tokens — the KV / conv caches persist instead of being
 /// rebuilt over the whole conversation. The reply is streamed, with the `<think>…</think>`
 /// reasoning shown in a different colour from the answer; the terminating `<|im_end|>` is
-/// suppressed. Sampling uses the model's recommended defaults; there is no system prompt.
+/// suppressed. Sampling uses the model's recommended defaults unless overridden by flags
+/// (`--greedy`, `--max-gen`, `--max-think`, `--no-think`); there is no system prompt.
 fn cmd_chat(path: &str, args: &[String]) -> Cmd {
-    let model = Model::load(path)?;
-    let mut agent = Agent::new(&model)?;
-    if let Some(s) = args.first() {
-        let max_gen = s.parse().map_err(|_| format!("invalid max-new {s:?}"))?;
-        agent = agent.max_gen(max_gen);
+    let (opts, positional) = parse_agent_options(args)?;
+    if !positional.is_empty() {
+        return Err(format!("chat takes no prompt arguments; got {positional:?}").into());
     }
+    let model = Model::load(path)?;
+    let mut agent = opts.apply(Agent::new(&model)?);
     let pal = Palette::detect();
 
     eprintln!("Chat ready. Type a message. Input Ctrl-D or /exit to quit.\n");

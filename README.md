@@ -41,20 +41,26 @@ Build with `cargo build --release`, then run a subcommand on `./target/release/b
 examples below use `cargo run --release --` for convenience). Every subcommand loads the
 weights from `BEBELM_WEIGHTS_FILE` (see above).
 
-- **`chat [max-new]`** — interactive multi-turn chat. Streams the model's full output, showing
+- **`generate [options] <prompt>…`** — one-shot text completion of a prompt; streams tokens as
+  they are produced and reports prefill/decode throughput.
+- **`chat [options]`** — interactive multi-turn chat. Streams the model's full output, showing
   the `<think>...</think>` reasoning and the final answer in different colors. The KV / conv
-  caches persist across turns, so each message only prefills its own new tokens. Sampling uses
-  the model's recommended defaults. `max-new` caps the tokens generated per turn (default 2048).
-  `Ctrl-D` or `/exit` to quit.
-- **`complete <max-gen> <text>…`** — greedy text completion of a prompt; streams tokens as they
-  are produced and reports prefill/decode throughput.
+  caches persist across turns, so each message only prefills its own new tokens. `Ctrl-D` or
+  `/exit` to quit.
+
+Both commands take the same options (sampling defaults to the model's recommended settings):
+
+- `--greedy` — deterministic greedy decoding instead of sampling.
+- `--max-gen N` — cap tokens generated per turn (default 2048).
+- `--max-think N` — cap the `<think>` reasoning block to N tokens (forces `</think>`).
+- `--no-think` — disable reasoning (equivalent to `--max-think 0`).
 
 ```sh
 # Interactive chat
 cargo run --release -- chat
 
 # One-shot completion
-cargo run --release -- complete 64 "The capital of France is"
+cargo run --release -- generate --max-gen 64 "The capital of France is"
 ```
 
 ### CPU / SIMD build

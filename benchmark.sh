@@ -18,7 +18,7 @@ MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
 export BEBELM_WEIGHTS_FILE="$MODEL"
 MAX_NEW=64
 
-# A single user turn in the model's ChatML chat format. `complete` prepends BOS
+# A single user turn in the model's ChatML chat format. `generate` prepends BOS
 # (<|startoftext|>) and stops at <|im_end|>, so we open at <|im_start|>user and end with the
 # assistant-turn opener; the tokenizer encodes <|im_start|>/<|im_end|> as atomic token ids.
 USER_MSG="Tell me about the capital of France"
@@ -43,10 +43,10 @@ cargo build --release --quiet
 echo "running: chat completion ($MAX_NEW tokens) of: \"$USER_MSG\""
 echo
 # `tee` to a temp file so the generation streams to the terminal live (the per-token
-# flushes in `complete` make it appear token-by-token) while we still capture it to parse.
+# flushes in `generate` make it appear token-by-token) while we still capture it to parse.
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-./target/release/bebelm complete "$MAX_NEW" "$PROMPT" | tee "$TMP"
+./target/release/bebelm generate --greedy --max-gen "$MAX_NEW" "$PROMPT" | tee "$TMP"
 OUT="$(cat "$TMP")"
 echo
 
