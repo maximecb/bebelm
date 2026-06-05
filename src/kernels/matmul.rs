@@ -120,6 +120,123 @@ fn dot_q4k_block(block: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+// --- Q8-activation integer dot (opt 9h) ---
+//
+// The quantized matvec's bottleneck is the f32 dot, not the unpack. Quantizing the *input*
+// vector to int8 once per matmul lets each weight row dot in the integer domain — replacing
+// the f32 FMA with a fused int8 dot-product. Activations stay f32 everywhere else.
+
+/// One activation vector quantized to Q8: int8 quants, one f32 `scale` per 256-block, and the
+/// sum of quants per 32-wide sub-block (for Q4_K's `min` term, which needs `Σ q_x`).
+struct Q8Vec {
+    q: Vec<i8>,
+    scales: Vec<f32>,
+    sums: Vec<i32>,
+}
+
+/// Quantize activations to Q8: per 256-block `scale = max|x|/127`, `q = round(x/scale)` clamped
+/// to ±127. `x.len()` must be a multiple of 256 (true for K-quant `n_in`).
+fn quantize_q8(x: &[f32]) -> Q8Vec {
+    let nblocks = x.len() / 256;
+    let mut q = vec![0i8; x.len()];
+    let mut scales = vec![0.0f32; nblocks];
+    let mut sums = vec![0i32; x.len() / 32];
+    for b in 0..nblocks {
+        let xb = &x[b * 256..b * 256 + 256];
+        let amax = xb.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        scales[b] = amax / 127.0;
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        let qb = &mut q[b * 256..b * 256 + 256];
+        for (qi, &v) in qb.iter_mut().zip(xb) {
+            *qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+        for (s, sum) in sums[b * 8..b * 8 + 8].iter_mut().enumerate() {
+            *sum = qb[s * 32..s * 32 + 32].iter().map(|&v| v as i32).sum();
+        }
+    }
+    Q8Vec { q, scales, sums }
+}
+
+/// `Σ_{i=0..32} nib_i · qx_i`, where `nib` are the low (or high) nibbles of the 32 bytes `q`
+/// and `qx` are 32 int8 activations. The only arch-specific kernel: aarch64 uses the `sdot`
+/// int8 dot-product instruction; elsewhere `wide` widens to i16 and uses `i16x16::dot`
+/// (`pmaddwd` on x86/AVX2). `#[inline(always)]` so it folds into the per-block loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn nibble_idot32(q: &[u8], qx: &[i8], high: bool) -> i32 {
+    use core::arch::aarch64::*;
+    use core::arch::asm;
+    // SAFETY: aarch64 implies NEON; `dotprod` is in this target's features (default on Apple
+    // Silicon) so `sdot` is valid. Callers always pass ≥ 32 bytes of `q` and `qx`. The `sdot`
+    // *intrinsic* (`vdotq_s32`) is still nightly-gated (`stdarch_neon_dotprod`), so we emit the
+    // instruction with stable inline asm; the load/mask use stable NEON intrinsics.
+    unsafe {
+        let mut acc = vdupq_n_s32(0);
+        for c in 0..2 {
+            let bytes = vld1q_u8(q.as_ptr().add(c * 16));
+            let nib = if high { vshrq_n_u8::<4>(bytes) } else { vandq_u8(bytes, vdupq_n_u8(0x0f)) };
+            let w = vreinterpretq_s8_u8(nib);
+            let xv = vld1q_s8(qx.as_ptr().add(c * 16));
+            asm!(
+                "sdot {acc:v}.4s, {w:v}.16b, {xv:v}.16b",
+                acc = inout(vreg) acc,
+                w = in(vreg) w,
+                xv = in(vreg) xv,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        vaddvq_s32(acc)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn nibble_idot32(q: &[u8], qx: &[i8], high: bool) -> i32 {
+    use wide::{i16x16, i32x8, i8x16, u8x16};
+    const LOW: i16x16 = i16x16::new([0x0f; 16]);
+    let mut acc = i32x8::new([0; 8]);
+    for c in 0..2 {
+        let bytes: [u8; 16] = q[c * 16..c * 16 + 16].try_into().unwrap();
+        let w = i16x16::from(u8x16::new(bytes));
+        let nib = if high { (w >> 4) & LOW } else { w & LOW };
+        let xb: [i8; 16] = qx[c * 16..c * 16 + 16].try_into().unwrap();
+        acc = acc + nib.dot(i16x16::from(i8x16::new(xb)));
+    }
+    acc.reduce_add()
+}
+
+/// Q8-activation integer dot of one 144-byte Q4_K block against pre-quantized activations
+/// (`qx` = 256 int8, `sx` = block scale, `sums` = the 8 per-32 sub-block sums of `qx`):
+/// `Σ w·x = sx·(d·Σ_j sc_j·⟨q_w,q_x⟩_j − dmin·Σ_j m_j·Σq_x_j)`. The `⟨·,·⟩` are exact integer
+/// dots; only the activations carry Q8 rounding error.
+fn dot_q4k_block_q8(block: &[u8], qx: &[i8], sx: f32, sums: &[i32]) -> f32 {
+    let d = dequant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = dequant::f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+
+    let mut sd = 0.0f32; // Σ_j sc_j · ⟨q_w, q_x⟩_j
+    let mut sm = 0.0f32; // Σ_j m_j · Σ q_x_j
+    for c in 0..4 {
+        let q = &qs[c * 32..c * 32 + 32];
+        let (sc1, m1) = dequant::get_scale_min_k4(2 * c, scales);
+        let (sc2, m2) = dequant::get_scale_min_k4(2 * c + 1, scales);
+        let lo = nibble_idot32(q, &qx[(2 * c) * 32..], false);
+        let hi = nibble_idot32(q, &qx[(2 * c + 1) * 32..], true);
+        sd += sc1 as f32 * lo as f32 + sc2 as f32 * hi as f32;
+        sm += m1 as f32 * sums[2 * c] as f32 + m2 as f32 * sums[2 * c + 1] as f32;
+    }
+    sx * (d * sd - dmin * sm)
+}
+
+/// Q8-activation integer dot of a whole Q4_K weight row against pre-quantized activations.
+fn dot_q4k_row_q8(row: &[u8], a: &Q8Vec) -> f32 {
+    row.chunks_exact(144)
+        .enumerate()
+        .map(|(b, blk)| dot_q4k_block_q8(blk, &a.q[b * 256..b * 256 + 256], a.scales[b], &a.sums[b * 8..b * 8 + 8]))
+        .sum()
+}
+
 /// Over one 16-weight Q6_K sub-block, return `Σ (q_i − 32)·x_i` — the `−32` recentering
 /// folded into each lane. `ql`/`qh` are the current half's slices; `(ql_off, high, shift)`
 /// pick this group's `ql` nibble and `qh` 2-bit field (see [`dot_q6k_block`]); `l_start` is
@@ -207,13 +324,19 @@ pub fn matvec(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], y
     // 256-weight block dequantizes straight into the dot, so they need no scratch. Other
     // dtypes (F32/F16 — e.g. the MoE router) dequantize the whole row into `scratch`, then dot.
     let fused = matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K);
+    // Q4_K uses the Q8-activation integer dot: quantize x once, then dot it (read-only,
+    // shared across rows) against every weight row. Q6_K keeps the f32 fused dot for now;
+    // other dtypes dequantize a row into `scratch` then dot.
+    let q8 = (dtype == GgmlType::Q4_K).then(|| quantize_q8(x));
     let compute_row = |o: usize, scratch: &mut [f32]| -> f32 {
         let row = &w[o * row_bytes..(o + 1) * row_bytes];
-        if fused {
-            fused_row_dot(dtype, row, x)
-        } else {
-            dequant::dequantize_into(dtype, row, scratch);
-            dot(scratch, x)
+        match dtype {
+            GgmlType::Q4_K => dot_q4k_row_q8(row, q8.as_ref().unwrap()),
+            GgmlType::Q6_K => fused_row_dot(dtype, row, x),
+            _ => {
+                dequant::dequantize_into(dtype, row, scratch);
+                dot(scratch, x)
+            }
         }
     };
 
@@ -314,10 +437,8 @@ mod tests {
         assert_eq!(y, [2.0, 4.0, 6.0]);
     }
 
-    #[test]
-    fn matvec_q4k_fused_matches_dequant() {
-        // A non-trivial Q4_K block (varied scales/mins/nibbles) dotted against varied x:
-        // the fused path must match dequantize-then-dot to f32 tolerance.
+    /// A non-trivial Q4_K block + varied x, reused by the f32-path and Q8-path tests below.
+    fn q4k_test_block() -> (Vec<u8>, Vec<f32>) {
         let mut block = vec![0u8; 144];
         block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
         block[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // dmin = 0.25
@@ -328,13 +449,32 @@ mod tests {
             *b = (i * 37 + 11) as u8;
         }
         let x: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        (block, x)
+    }
 
+    #[test]
+    fn fused_row_dot_q4k_matches_dequant() {
+        // The f32 fused path (still used by `matvec_fused_batch`) must match dequant-then-dot.
+        let (block, x) = q4k_test_block();
         let weights = dequant::dequantize(GgmlType::Q4_K, &block, 256);
         let reference: f32 = weights.iter().zip(&x).map(|(&w, &xi)| w * xi).sum();
+        let got = fused_row_dot(GgmlType::Q4_K, &block, &x);
+        assert!((got - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{got} vs {reference}");
+    }
+
+    #[test]
+    fn matvec_q4k_q8_matches_quantized_reference() {
+        // matvec's Q4_K path is the Q8-activation integer dot. It should equal the exact dot of
+        // the dequantized weights with the Q8-rounded activations (`sx · q_x`) — i.e. the only
+        // error vs true is the int8 quantization of x, not the integer dot itself.
+        let (block, x) = q4k_test_block();
+        let weights = dequant::dequantize(GgmlType::Q4_K, &block, 256);
+        let a = quantize_q8(&x);
+        let reference: f32 = weights.iter().zip(&a.q).map(|(&w, &q)| w * (a.scales[0] * q as f32)).sum();
 
         let mut y = [0.0f32];
         matvec(GgmlType::Q4_K, &block, 256, 1, &x, &mut y);
-        assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {}", y[0], reference);
+        assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {reference}", y[0]);
     }
 
     #[test]
