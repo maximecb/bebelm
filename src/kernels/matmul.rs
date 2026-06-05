@@ -20,7 +20,7 @@ use wide::f32x8;
 const PAR_MIN_ROWS: usize = 64;
 
 /// Read the first 8 elements of `s` as an `f32x8` (one 256-bit / 2× NEON vector).
-#[inline]
+#[inline(always)]
 fn load8(s: &[f32]) -> f32x8 {
     f32x8::from(<[f32; 8]>::try_from(&s[..8]).unwrap())
 }
@@ -69,7 +69,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// the matching 32 activations, return `(Σ nibble_i · x_i, Σ x_i)` — the two sums the Q4_K
 /// factoring below needs. The dot/sum accumulate in `f32x8`; the per-byte nibble mask/shift
 /// stays scalar (portable SIMD can't widen `u8`→`f32` lanes without a scalar gather).
-#[inline]
+#[inline(always)]
 fn nibble_dot32(q: &[u8], x: &[f32], high: bool) -> (f32, f32) {
     let mut qx = f32x8::splat(0.0);
     let mut xs = f32x8::splat(0.0);
@@ -100,6 +100,7 @@ fn nibble_dot32(q: &[u8], x: &[f32], high: bool) -> (f32, f32) {
 /// (not per weight). Block layout (see `dequant`'s module doc): `d:f16  dmin:f16
 /// scales:u8[12]  qs:u8[128]`; the 4 chunks of 32 packed bytes each yield a low-nibble then
 /// a high-nibble sub-block, matching `dequant::dequantize_q4_k_block`'s output ordering.
+#[inline(always)]
 fn dot_q4k_block(block: &[u8], x: &[f32]) -> f32 {
     let d = dequant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let dmin = dequant::f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
@@ -209,6 +210,7 @@ fn nibble_idot32(q: &[u8], qx: &[i8], high: bool) -> i32 {
 /// (`qx` = 256 int8, `sx` = block scale, `sums` = the 8 per-32 sub-block sums of `qx`):
 /// `Σ w·x = sx·(d·Σ_j sc_j·⟨q_w,q_x⟩_j − dmin·Σ_j m_j·Σq_x_j)`. The `⟨·,·⟩` are exact integer
 /// dots; only the activations carry Q8 rounding error.
+#[inline(always)]
 fn dot_q4k_block_q8(block: &[u8], qx: &[i8], sx: f32, sums: &[i32]) -> f32 {
     let d = dequant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let dmin = dequant::f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
@@ -230,6 +232,7 @@ fn dot_q4k_block_q8(block: &[u8], qx: &[i8], sx: f32, sums: &[i32]) -> f32 {
 }
 
 /// Q8-activation integer dot of a whole Q4_K weight row against pre-quantized activations.
+#[inline(always)]
 fn dot_q4k_row_q8(row: &[u8], a: &Q8Vec) -> f32 {
     row.chunks_exact(144)
         .enumerate()
@@ -241,7 +244,7 @@ fn dot_q4k_row_q8(row: &[u8], a: &Q8Vec) -> f32 {
 /// folded into each lane. `ql`/`qh` are the current half's slices; `(ql_off, high, shift)`
 /// pick this group's `ql` nibble and `qh` 2-bit field (see [`dot_q6k_block`]); `l_start` is
 /// the sub-block's offset (0 or 16) into the half's 32-wide index `l`.
-#[inline]
+#[inline(always)]
 fn q6_dot16(ql: &[u8], qh: &[u8], ql_off: usize, high: bool, shift: u32, l_start: usize, x: &[f32]) -> f32 {
     let mut qx = f32x8::splat(0.0);
     for c in 0..2 {
@@ -266,6 +269,7 @@ fn q6_dot16(ql: &[u8], qh: &[u8], ql_off: usize, high: bool, shift: u32, l_start
 /// (see `dequant`'s module doc): `ql:u8[128]  qh:u8[64]  scales:i8[16]  d:f16`. Each
 /// 128-weight half splits into 4 groups of 32 (a low/high `ql` nibble + a 2-bit `qh` field),
 /// each group into two 16-weight sub-blocks — matching `dequant::dequantize_q6_k_block`.
+#[inline(always)]
 fn dot_q6k_block(block: &[u8], x: &[f32]) -> f32 {
     // (ql byte offset within the half, take ql's high nibble?, qh bit shift) per group.
     const GROUPS: [(usize, bool, u32); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];

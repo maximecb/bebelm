@@ -18,6 +18,7 @@ const Q6_K_BYTES: usize = 210;
 ///
 /// Hand-rolled (exact, incl. subnormals/inf/nan) so we don't pull in a crate for the one
 /// conversion we need — f16 only appears as the per-block scales inside Q4_K/Q6_K.
+#[inline]
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = (h as u32 & 0x8000) << 16;
     let exp = (h >> 10) & 0x1f;
@@ -59,7 +60,7 @@ fn read_f16(bytes: &[u8], at: usize) -> f32 {
 
 /// Unpack the 6-bit sub-block scale `sc` and min `m` for sub-block `j` from the packed
 /// 12-byte `scales` array of a Q4_K block (ggml's `get_scale_min_k4`).
-#[inline]
+#[inline(always)]
 pub(crate) fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     if j < 4 {
         (scales[j] & 63, scales[j + 4] & 63)

@@ -450,8 +450,9 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | **9j ✅** | **AVX2 + FMA on x86** — `.cargo/config.toml` sets `target-cpu=native`; the default x86_64 baseline is SSE2-only, so `wide`'s `f32x8` ran at half width. Scoped to x86_64 (arm64/NEON untouched). | trivial | x86 target only (not yet measured on the i5); arm64 unchanged |
 | **9k ⚠️** | **Vectorize the K-quant unpack** — replace the per-lane scalar gather in `nibble_dot32` with in-vector `wide` widening (`u8x16 → i16x16 → i32x8 → round_float → f32x8`, split via `bytemuck::cast`). **Tried on `nibble_dot32`: bit-identical, but measured ~neutral on M5 (≤4%, within noise) → reverted.** The unpack isn't the dot's bottleneck (the fixed f32 FMA/load throughput is). May still pay off on x86/AVX2 (untested), where the scalar gather likely costs more. See notes. | moderate | **~0 on M5** (NEON); possibly positive on AVX2 |
 | **9l** | **Multi-row register blocking in `matvec`** — compute 2–4 output rows per pass, reusing the `x` loads and amortizing loop/reduce overhead. Portable. | moderate | est. modest; helps the compute fraction only |
+| **9m ✅** | **`#[inline(always)]` on hot kernel leaves** — force-inline the small private functions in the `matvec`/dequant inner loops so they fold into the per-block dot (`load8`, `nibble_dot32`, `nibble_idot32`, `q6_dot16`, `get_scale_min_k4`, and the single-call-site per-block dots `dot_q4k_block`/`dot_q6k_block`/`dot_q4k_block_q8`/`dot_q4k_row_q8`). See notes. | trivial | within noise (≈neutral–slightly positive on M5); output bit-identical |
 
-Suggested order: **9a–9e + 9i + 9j done**. Next: **9k** (vectorize the unpack — the
+Suggested order: **9a–9e + 9i + 9j + 9m done**. Next: **9k** (vectorize the unpack — the
 compute-bound hot path), then **9l**; **9f** for long prompts, **9g** for long contexts, **9h**
 last (largest rewrite; supersedes 9d/9e/9k on the hot path). Further fork/join trimming beyond
 9i was tried (batching q/k/v + dense gate/up) and measured **neutral**, so it's deprioritized.
@@ -506,3 +507,20 @@ no f32 weight materialization, compact weight traffic, fast int8 dot. Caveats: i
 **VNNI** (x86) / **dotprod** (NEON) instructions that `wide`/`std::simd` don't expose, so
 a fully portable version gets the algorithmic win but maybe not the absolute peak without
 `std::arch` — a slight tension with the cross-platform-SIMD preference.
+
+**9m — inline directive for kernels.** Under the release profile (`codegen-units = 1` +
+thin LTO) the compiler already inlines small intra-crate functions, so this mostly (a)
+encodes intent, (b) guarantees inlining in the dev profile (`opt-level = 1`) and if the
+CGU count is ever split, and (c) forces *cross-crate* inlining of the `pub` leaves. Rule of
+thumb for kernel code:
+
+- `#[inline(always)]` → **private** hot-path functions that are either tiny SIMD leaves
+  *or* have a single call site (so there's no code-bloat risk — they expand in one place
+  regardless): the micro-ops and per-block dots listed in 9m.
+- `#[inline]` → **`pub`, multi-call-site** functions (`dot`, `fused_row_dot`,
+  `f16_to_f32`): let the optimizer weigh bloat across call sites, and enable cross-crate
+  inlining without forcing it.
+- Leave the per-call kernel **entry points** (`matvec`, `matvec_fused_batch`, `rmsnorm`,
+  `softmax`, `attention_decode`, `conv_step`) and the `model.rs` orchestration un-annotated
+  — they run only O(layers)/token, so call overhead is negligible and force-inlining would
+  only bloat code with no hot-loop payoff.
