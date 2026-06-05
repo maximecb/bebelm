@@ -204,7 +204,10 @@ impl Model {
 
         cache.k[layer].extend_from_slice(&k);
         cache.v[layer].extend_from_slice(&v);
-        let n_ctx = pos + 1;
+        // Attend over whatever is in the KV window — normally `pos + 1`, fewer once the window
+        // has been slid (old positions evicted). RoPE keys keep their original-position rotation,
+        // so the query↔key offsets stay correct.
+        let n_ctx = cache.k[layer].len() / KV_DIM;
 
         let mut attn = vec![0.0f32; HIDDEN];
         attention_decode(&q, &cache.k[layer], &cache.v[layer], n_ctx, N_HEADS, N_KV_HEADS, HEAD_DIM, &mut attn);

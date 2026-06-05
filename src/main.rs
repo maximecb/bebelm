@@ -1,8 +1,8 @@
 //! bebelm — CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M).
 //!
-//! CLI over the `bebelm` library: tokenize text, run the forward pass, greedily
-//! generate / complete, or hold an interactive `chat`. The weights file is taken from
-//! `$BEBELM_WEIGHTS_FILE`, not the command line.
+//! CLI over the `bebelm` library: run the forward pass, greedily generate / complete, or
+//! hold an interactive `chat`. The weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the
+//! command line.
 
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
@@ -19,9 +19,8 @@ fn weights_path() -> String {
 
 use bebelm::agent::Agent;
 use bebelm::config;
-use bebelm::gguf::GgufFile;
 use bebelm::model::Model;
-use bebelm::tokenizer::{self, Tokenizer};
+use bebelm::tokenizer;
 
 type Cmd = Result<(), Box<dyn Error>>;
 
@@ -34,7 +33,6 @@ fn main() -> ExitCode {
             Some(max) => cmd_generate(&path, max, &args[3..]),
             None => return usage("generate <max-new-tokens> <token-id>..."),
         },
-        Some("tokenize") => cmd_tokenize(&path, &args[2..]),
         Some("complete") => match args.get(2) {
             Some(max) => cmd_complete(&path, max, &args[3..]),
             None => return usage("complete <max-new-tokens> <text>..."),
@@ -45,7 +43,6 @@ fn main() -> ExitCode {
             eprintln!("usage:");
             eprintln!("  bebelm logits   <token-id>...        forward pass, print next-token logits");
             eprintln!("  bebelm generate <max-new> <token>... greedy-generate token ids");
-            eprintln!("  bebelm tokenize <text>...            encode/decode round-trip");
             eprintln!("  bebelm complete <max-new> <text>...  greedy text completion");
             eprintln!("  bebelm chat     [max-new]            interactive chat (streams thinking + reply)");
             eprintln!("\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})");
@@ -99,20 +96,6 @@ fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
 
     println!("prompt    : {prompt:?}");
     println!("generated : {:?}", turn.ids);
-    Ok(())
-}
-
-/// Encode text to token ids and decode back — a round-trip check on the real vocab.
-fn cmd_tokenize(path: &str, text_args: &[String]) -> Cmd {
-    let text = text_args.join(" ");
-    let g = GgufFile::open(path)?;
-    let tok = Tokenizer::from_gguf(&g)?;
-    let ids = tok.encode(&text, false);
-    let decoded = tok.decode(&ids);
-    println!("text       : {text:?}");
-    println!("ids        : {ids:?}");
-    println!("decoded    : {decoded:?}");
-    println!("round-trip : {}", if decoded == text { "OK" } else { "MISMATCH" });
     Ok(())
 }
 

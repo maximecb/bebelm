@@ -21,8 +21,8 @@ use crate::tokenizer::{
 /// generous; it only bounds a runaway turn.
 const DEFAULT_MAX_GEN: usize = 2048;
 
-/// Default cap on the transcript length (tokens) the agent will decode up to. The model
-/// supports far more positions; this is a conservative session default.
+/// Default KV attention-window cap (tokens); once exceeded, the oldest context slides out so
+/// decoding can continue. A conservative session default; the model supports far more.
 const DEFAULT_MAX_CONTEXT: usize = 32_768;
 
 /// Text appended to open an assistant turn before generating its reply.
@@ -42,8 +42,6 @@ pub enum StopReason {
     Eos,
     /// Hit the per-turn `max_gen` cap.
     MaxNew,
-    /// The transcript reached `max_context`.
-    ContextFull,
 }
 
 /// Timing + counts from a generation run.
@@ -141,7 +139,8 @@ impl<'m> Agent<'m> {
         self
     }
 
-    /// Cap the total transcript length (tokens) the agent will decode up to.
+    /// Cap the KV attention window (in tokens). When decoding would exceed it, the oldest
+    /// context is dropped (a sliding window) instead of stopping.
     pub fn max_context(mut self, n: usize) -> Self {
         self.max_context = n;
         self
@@ -191,8 +190,9 @@ impl<'m> Agent<'m> {
     }
 
     /// Prefill any appended-but-unprocessed tokens, then decode a continuation until the model
-    /// emits EOS, hits `max_gen`, or fills the context. Visible tokens are appended to the
-    /// transcript and streamed to `on_token`; the terminating EOS is not.
+    /// emits EOS or hits `max_gen`. Past `max_context` the KV window slides (oldest context
+    /// dropped) rather than stopping. Visible tokens are appended to the transcript and streamed
+    /// to `on_token`; the terminating EOS is not.
     pub fn generate(&mut self, mut on_token: impl FnMut(u32, &str)) -> Turn {
         // Prefill: run every pending token except the last through the caches; the last token's
         // logits seed the decode loop. Invariant: cache.pos == number of absorbed history tokens.
@@ -203,8 +203,10 @@ impl<'m> Agent<'m> {
             .expect("generate: no pending tokens to generate from");
         for &tok in rest {
             self.model.run_layers(tok, &mut self.cache);
+            Self::trim_context(&mut self.cache, self.max_context);
         }
         let mut logits = self.model.forward_step(last, &mut self.cache);
+        Self::trim_context(&mut self.cache, self.max_context);
         let prefill = t_prefill.elapsed();
 
         // Decode one token at a time, feeding each back through the caches.
@@ -240,10 +242,9 @@ impl<'m> Agent<'m> {
             if ids.len() >= self.max_gen {
                 break StopReason::MaxNew;
             }
-            if self.history.len() >= self.max_context {
-                break StopReason::ContextFull;
-            }
             logits = self.model.forward_step(next, &mut self.cache);
+            // Slide the KV window instead of stopping once the context cap is reached.
+            Self::trim_context(&mut self.cache, self.max_context);
         };
         let decode = t_decode.elapsed();
 
@@ -255,6 +256,17 @@ impl<'m> Agent<'m> {
             decode,
         };
         Turn { ids, text, stats, stop }
+    }
+
+    /// Slide the KV attention window down to `max_context` positions once it grows past the cap,
+    /// dropping the oldest context so decoding continues. `cache.pos` (the absolute RoPE
+    /// position) is left untouched — RoPE attention depends only on the query↔key offset, which
+    /// stays within the window, so the retained keys remain correctly positioned.
+    fn trim_context(cache: &mut Cache, max_context: usize) {
+        let len = cache.kv_len();
+        if len > max_context {
+            cache.evict_front(len - max_context);
+        }
     }
 
     /// Clear the conversation (transcript + caches), keeping the loaded weights and config.
