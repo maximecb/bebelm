@@ -1,0 +1,10 @@
+# Build the x86 SIMD kernels with AVX2 + FMA. The default x86_64 baseline is SSE2-only, so
+# `wide`'s f32x8 compiles to two 128-bit ops — half the SIMD width on any AVX2 CPU (e.g. the
+# i5-6500T target). `x86-64-v3` is the "Haswell, 2013+" microarchitecture level (AVX2, FMA,
+# BMI); the binary then requires such a CPU. Scoped to x86_64 so the arm64/NEON build (which
+# already has 128-bit SIMD and no AVX) is untouched.
+#
+# To instead optimize for whatever CPU you build on (also picks up e.g. AVX-512, but isn't
+# reproducible across machines), use ["-C", "target-cpu=native"].
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
