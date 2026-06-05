@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-MODEL="${1:-models/LFM2.5-8B-A1B-Q4_K_M.gguf}"
+MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
 PROMPT="Tell me about the capital of France"
 
 DURATION="${DURATION:-20}"

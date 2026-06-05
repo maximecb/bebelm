@@ -1,5 +1,4 @@
 /target
-/models
 *.gguf
 
 # profile.sh output

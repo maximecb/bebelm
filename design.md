@@ -34,8 +34,7 @@ Download the official GGUF from Hugging Face:
   `https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf`
 
 ```sh
-mkdir -p models
-curl -L -o models/LFM2.5-8B-A1B-Q4_K_M.gguf \
+curl -L -o LFM2.5-8B-A1B-Q4_K_M.gguf \
   "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf"
 ```
 

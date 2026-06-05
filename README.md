@@ -6,7 +6,17 @@ Intentionally has very few dependencies and requires no extra system packages to
 
 This is a library crate so the model can be imported.
 
-In order to run, the weights GGUF file needs to be downloaded first (5.2GB).
+### Download the weights
+
+Running requires the ~5.2 GB Q4_K_M GGUF. Download it into the repo root:
+
+```sh
+curl -L -o LFM2.5-8B-A1B-Q4_K_M.gguf \
+  "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf"
+```
+
+`benchmark.sh` and `profile.sh` default to this filename in the repo root; you can also pass a
+different path as their first argument.
 
 ### CPU / SIMD build
 

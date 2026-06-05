@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-MODEL="${1:-models/LFM2.5-8B-A1B-Q4_K_M.gguf}"
+MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
 MAX_NEW=64
 
 # A single user turn in the model's ChatML chat format. `complete` prepends BOS
