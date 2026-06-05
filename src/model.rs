@@ -89,18 +89,6 @@ impl Model {
 
     // --- forward pass (single-token, cached) ---
 
-    /// Run the prompt through the model and return the logits for the **last** position
-    /// (length [`VOCAB`]), using a fresh cache internally. Intermediate tokens only update
-    /// the cache (their logits are skipped — 9a).
-    pub fn forward(&self, tokens: &[u32]) -> Vec<f32> {
-        let (last, rest) = tokens.split_last().expect("forward: empty token sequence");
-        let mut cache = Cache::new();
-        for &tok in rest {
-            self.run_layers(tok, &mut cache);
-        }
-        self.forward_step(*last, &mut cache)
-    }
-
     /// Process one token at position `cache.pos`, update the caches, and return its
     /// next-token logits. One pass over the weights, plus O(context) attention.
     pub fn forward_step(&self, token: u32, cache: &mut Cache) -> Vec<f32> {

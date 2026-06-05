@@ -1,8 +1,7 @@
 //! bebelm — CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M).
 //!
-//! CLI over the `bebelm` library: run the forward pass, greedily generate / complete, or
-//! hold an interactive `chat`. The weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the
-//! command line.
+//! CLI over the `bebelm` library: greedily `complete` a prompt, or hold an interactive
+//! `chat`. The weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the command line.
 
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
@@ -18,7 +17,6 @@ fn weights_path() -> String {
 }
 
 use bebelm::agent::Agent;
-use bebelm::config;
 use bebelm::model::Model;
 use bebelm::tokenizer;
 
@@ -28,11 +26,6 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let path = weights_path();
     let result: Cmd = match args.get(1).map(String::as_str) {
-        Some("logits") => cmd_logits(&path, &args[2..]),
-        Some("generate") => match args.get(2) {
-            Some(max) => cmd_generate(&path, max, &args[3..]),
-            None => return usage("generate <max-new-tokens> <token-id>..."),
-        },
         Some("complete") => match args.get(2) {
             Some(max) => cmd_complete(&path, max, &args[3..]),
             None => return usage("complete <max-new-tokens> <text>..."),
@@ -41,8 +34,6 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
-            eprintln!("  bebelm logits   <token-id>...        forward pass, print next-token logits");
-            eprintln!("  bebelm generate <max-new> <token>... greedy-generate token ids");
             eprintln!("  bebelm complete <max-new> <text>...  greedy text completion");
             eprintln!("  bebelm chat     [max-new]            interactive chat (streams thinking + reply)");
             eprintln!("\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})");
@@ -61,42 +52,6 @@ fn main() -> ExitCode {
 fn usage(line: &str) -> ExitCode {
     eprintln!("usage: bebelm {line}");
     ExitCode::FAILURE
-}
-
-/// Parse a list of decimal token-id strings, bounds-checking against the vocab.
-fn parse_tokens(args: &[String]) -> Result<Vec<u32>, Box<dyn Error>> {
-    let mut tokens = Vec::with_capacity(args.len());
-    for s in args {
-        let id: u32 = s
-            .parse()
-            .map_err(|_| format!("invalid token id {s:?} (must be a non-negative integer)"))?;
-        if id as usize >= config::VOCAB {
-            return Err(format!("token id {id} out of range (vocab = {})", config::VOCAB).into());
-        }
-        tokens.push(id);
-    }
-    Ok(tokens)
-}
-
-/// Greedy-generate token ids from a prompt of token ids (text I/O arrives with the tokenizer).
-fn cmd_generate(path: &str, max_str: &str, token_args: &[String]) -> Cmd {
-    let max_gen: usize = max_str
-        .parse()
-        .map_err(|_| format!("invalid max-new-tokens {max_str:?}"))?;
-    let prompt = parse_tokens(token_args)?;
-    if prompt.is_empty() {
-        return Err("need at least one prompt token id".into());
-    }
-
-    let model = Model::load(path)?;
-    eprintln!("greedy-generating up to {max_gen} token(s) (cached, multi-threaded)...");
-    let mut agent = Agent::new(&model)?.greedy().max_gen(max_gen);
-    agent.append_tokens(&prompt);
-    let turn = agent.generate(|_, _| {});
-
-    println!("prompt    : {prompt:?}");
-    println!("generated : {:?}", turn.ids);
-    Ok(())
 }
 
 /// Encode text, greedy-generate a continuation, and decode it back to text.
@@ -143,51 +98,6 @@ fn cmd_complete(path: &str, max_str: &str, text_args: &[String]) -> Cmd {
         turn.stats.decode.as_secs_f64() * 1e3,
         turn.stats.decode_tps()
     );
-    Ok(())
-}
-
-/// Run the forward pass on raw token ids and print the next-token logit summary.
-fn cmd_logits(path: &str, token_args: &[String]) -> Cmd {
-    let tokens = parse_tokens(token_args)?;
-    if tokens.is_empty() {
-        return Err("need at least one token id".into());
-    }
-
-    let model = Model::load(path)?;
-    eprintln!(
-        "running forward pass on {} token(s) (uncached, multi-threaded; may take a while)...",
-        tokens.len()
-    );
-    let logits = model.forward(&tokens);
-
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    let mut sum = 0.0f64;
-    let mut nonfinite = 0usize;
-    for &v in &logits {
-        if v.is_finite() {
-            min = min.min(v);
-            max = max.max(v);
-            sum += v as f64;
-        } else {
-            nonfinite += 1;
-        }
-    }
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-
-    println!("tokens    : {tokens:?}");
-    println!("logits    : {} (vocab)", logits.len());
-    println!("min/max   : {min:.4} / {max:.4}");
-    println!("mean      : {:.4}", sum / logits.len() as f64);
-    if nonfinite > 0 {
-        println!("non-finite: {nonfinite}  (BUG — expected 0)");
-    }
-    println!("argmax    : token {} (logit {:.4})", idx[0], logits[idx[0]]);
-    println!("top-5:");
-    for &i in idx.iter().take(5) {
-        println!("  token {i:>6}  logit {:.4}", logits[i]);
-    }
     Ok(())
 }
 

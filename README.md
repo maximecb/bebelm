@@ -48,9 +48,6 @@ weights from `BEBELM_WEIGHTS_FILE` (see above).
   `Ctrl-D` or `/exit` to quit.
 - **`complete <max-gen> <text>…`** — greedy text completion of a prompt; streams tokens as they
   are produced and reports prefill/decode throughput.
-- **`generate <max-gen> <token-id>…`** — greedy-generate from raw prompt token ids.
-- **`logits <token-id>…`** — run one forward pass on raw token ids and print a summary of the
-  next-token logits (argmax + top-5).
 
 ```sh
 # Interactive chat
