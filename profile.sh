@@ -24,6 +24,7 @@
 set -euo pipefail
 
 MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
+export BEBELM_WEIGHTS_FILE="$MODEL"
 PROMPT="Tell me about the capital of France"
 
 DURATION="${DURATION:-20}"
@@ -50,7 +51,7 @@ BIN=./target/release/bebelm
 # interleave with the profiler's output. MAX_NEW is kept large so the process stays alive
 # for the whole window; we kill it afterward in the trap.
 LOG="$(mktemp)"
-"$BIN" complete "$MODEL" "$MAX_NEW" "$PROMPT" >"$LOG" 2>&1 &
+"$BIN" complete "$MAX_NEW" "$PROMPT" >"$LOG" 2>&1 &
 PID=$!
 
 cleanup() {

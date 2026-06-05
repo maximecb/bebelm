@@ -1,11 +1,21 @@
 //! bebelm — CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M).
 //!
 //! CLI over the `bebelm` library: inspect a GGUF (`dump`), sanity-check the dequant
-//! kernels on a tensor (`dequant`), or load + validate the whole model (`load`).
+//! kernels on a tensor (`dequant`), or load + validate the whole model (`load`). The
+//! weights file is taken from `$BEBELM_WEIGHTS_FILE`, not the command line.
 
 use std::error::Error;
 use std::io::Write;
 use std::process::ExitCode;
+
+/// Default weights path when `$BEBELM_WEIGHTS_FILE` is unset (relative to the cwd).
+const DEFAULT_WEIGHTS_FILE: &str = "./LFM2.5-8B-A1B-Q4_K_M.gguf";
+
+/// Resolve the GGUF weights path from `$BEBELM_WEIGHTS_FILE`, defaulting to the file in
+/// the current working directory.
+fn weights_path() -> String {
+    std::env::var("BEBELM_WEIGHTS_FILE").unwrap_or_else(|_| DEFAULT_WEIGHTS_FILE.to_string())
+}
 
 use bebelm::config;
 use bebelm::gguf::{GgufFile, MetaValue};
@@ -18,45 +28,37 @@ type Cmd = Result<(), Box<dyn Error>>;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
+    let path = weights_path();
     let result: Cmd = match args.get(1).map(String::as_str) {
-        Some("dump") => match args.get(2) {
-            Some(path) => cmd_dump(path),
-            None => return usage("dump <model.gguf>"),
+        Some("dump") => cmd_dump(&path),
+        Some("dequant") => match args.get(2) {
+            Some(name) => cmd_dequant(&path, name),
+            None => return usage("dequant <tensor-name>"),
         },
-        Some("dequant") => match (args.get(2), args.get(3)) {
-            (Some(path), Some(name)) => cmd_dequant(path, name),
-            _ => return usage("dequant <model.gguf> <tensor-name>"),
+        Some("load") => cmd_load(&path),
+        Some("logits") => cmd_logits(&path, &args[2..]),
+        Some("generate") => match args.get(2) {
+            Some(max) => cmd_generate(&path, max, &args[3..]),
+            None => return usage("generate <max-new-tokens> <token-id>..."),
         },
-        Some("load") => match args.get(2) {
-            Some(path) => cmd_load(path),
-            None => return usage("load <model.gguf>"),
-        },
-        Some("logits") => match args.get(2) {
-            Some(path) => cmd_logits(path, &args[3..]),
-            None => return usage("logits <model.gguf> <token-id>..."),
-        },
-        Some("generate") => match (args.get(2), args.get(3)) {
-            (Some(path), Some(max)) => cmd_generate(path, max, &args[4..]),
-            _ => return usage("generate <model.gguf> <max-new-tokens> <token-id>..."),
-        },
-        Some("tokenize") => match args.get(2) {
-            Some(path) => cmd_tokenize(path, &args[3..]),
-            None => return usage("tokenize <model.gguf> <text>..."),
-        },
-        Some("complete") => match (args.get(2), args.get(3)) {
-            (Some(path), Some(max)) => cmd_complete(path, max, &args[4..]),
-            _ => return usage("complete <model.gguf> <max-new-tokens> <text>..."),
+        Some("tokenize") => cmd_tokenize(&path, &args[2..]),
+        Some("complete") => match args.get(2) {
+            Some(max) => cmd_complete(&path, max, &args[3..]),
+            None => return usage("complete <max-new-tokens> <text>..."),
         },
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
-            eprintln!("  bebelm dump     <model.gguf>                       list metadata and tensors");
-            eprintln!("  bebelm dequant  <model.gguf> <tensor-name>         dequantize a tensor, print stats");
-            eprintln!("  bebelm load     <model.gguf>                       load + validate against the config");
-            eprintln!("  bebelm logits   <model.gguf> <token-id>...         forward pass, print next-token logits");
-            eprintln!("  bebelm generate <model.gguf> <max-new> <token>...  greedy-generate token ids");
-            eprintln!("  bebelm tokenize <model.gguf> <text>...             encode/decode round-trip");
-            eprintln!("  bebelm complete <model.gguf> <max-new> <text>...   greedy text completion");
+            eprintln!("  bebelm dump                          list metadata and tensors");
+            eprintln!("  bebelm dequant  <tensor-name>        dequantize a tensor, print stats");
+            eprintln!("  bebelm load                          load + validate against the config");
+            eprintln!("  bebelm logits   <token-id>...        forward pass, print next-token logits");
+            eprintln!("  bebelm generate <max-new> <token>... greedy-generate token ids");
+            eprintln!("  bebelm tokenize <text>...            encode/decode round-trip");
+            eprintln!("  bebelm complete <max-new> <text>...  greedy text completion");
+            eprintln!(
+                "\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})"
+            );
             return ExitCode::FAILURE;
         }
     };

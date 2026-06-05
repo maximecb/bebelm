@@ -1,10 +1,14 @@
 BebeLM
 ------
 
-Pure-Rust, CPU-only implementation of LFM2.5-8B-A1B.
-Intentionally has very few dependencies and requires no extra system packages to run.
+Pure-Rust, CPU-only implementation of [LFM2.5-8B-A1B](https://www.liquid.ai/blog/lfm2-5-8b-a1b).
+This model is very capable and has only 1B active parameters, making it possible for the
+model to run at interactive speeds without a GPU.
 
-This is a library crate so the model can be imported.
+This package intentionally has very few dependencies and requires no extra system
+packages to run, making it easy to build and run.
+This is a library crate so the model can be imported. There is also a basic command-line
+interface that you can use.
 
 ### Download the weights
 
@@ -15,8 +19,15 @@ curl -L -o LFM2.5-8B-A1B-Q4_K_M.gguf \
   "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf"
 ```
 
+The CLI reads the weights path from the `BEBELM_WEIGHTS_FILE` environment variable, defaulting
+to `./LFM2.5-8B-A1B-Q4_K_M.gguf` (repo root). You can point it elsewhere with:
+
+```sh
+export BEBELM_WEIGHTS_FILE=/path/to/LFM2.5-8B-A1B-Q4_K_M.gguf
+```
+
 `benchmark.sh` and `profile.sh` default to this filename in the repo root; you can also pass a
-different path as their first argument.
+different path as their first argument (they set `BEBELM_WEIGHTS_FILE` for you).
 
 ### CPU / SIMD build
 

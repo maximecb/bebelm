@@ -383,7 +383,8 @@ src/
    confirmed the Q4_K/Q6_K/F32 mix and the verified tensor-name mapping above.
 2. ✅ **Dequant kernels** (`kernels/dequant.rs`): hand-rolled `f16_to_f32`, Q4_K + Q6_K
    block decoders (exact ggml reference) + an F32/F16/Q4_K/Q6_K dispatcher. Unit-tested on
-   synthetic blocks and validated on real tensors via `bebelm dequant <file> <tensor>`.
+   synthetic blocks and validated on real tensors via `bebelm dequant <tensor>` (the GGUF
+   path comes from `$BEBELM_WEIGHTS_FILE`).
 3. ✅ **Quantized GEMV + RMSNorm** (`kernels/matmul.rs`, `kernels/rmsnorm.rs`):
    `matvec(dtype, W, n_in, n_out, x, y)` (dequantize-row-then-dot, reused buffer) and
    `rmsnorm(x, gain, eps, out)`. Unit-tested on hand-computed cases (incl. row-major

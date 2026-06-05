@@ -15,6 +15,7 @@
 set -euo pipefail
 
 MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
+export BEBELM_WEIGHTS_FILE="$MODEL"
 MAX_NEW=64
 
 # A single user turn in the model's ChatML chat format. `complete` prepends BOS
@@ -45,7 +46,7 @@ echo
 # flushes in `complete` make it appear token-by-token) while we still capture it to parse.
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-./target/release/bebelm complete "$MODEL" "$MAX_NEW" "$PROMPT" | tee "$TMP"
+./target/release/bebelm complete "$MAX_NEW" "$PROMPT" | tee "$TMP"
 OUT="$(cat "$TMP")"
 echo
 
