@@ -1,5 +1,6 @@
 //! The one sampler (KISS): temperature + top-k, with `temperature == 0` ⇒ greedy argmax,
-//! plus an optional repetition penalty. Hand-rolled xorshift PRNG (no `rand` crate).
+//! plus an optional presence-based repetition penalty (each distinct prior token penalized at
+//! most once, as in HF transformers and llama.cpp). Hand-rolled xorshift PRNG (no `rand` crate).
 //!
 //! Defaults follow Liquid's recommendation for LFM2.5-8B-A1B: temperature 0.2, top-k 80,
 //! repeat-penalty 1.05.
@@ -13,17 +14,31 @@ pub struct Sampler {
     pub temperature: f32,
     /// Keep only the `top_k` highest-logit candidates (`0` ⇒ no limit).
     pub top_k: usize,
-    /// Divide already-seen tokens' logits by this (`1.0` ⇒ disabled).
+    /// Penalize each distinct already-seen token's logit by this, once (`1.0` ⇒ disabled).
     pub repeat_penalty: f32,
     rng: u64,
     /// Reused scratch buffer of candidate indices for top-k, so each call doesn't allocate a
     /// fresh vocab-sized `Vec`.
     cand: Vec<usize>,
+    /// Repetition-penalty dedup: `last_pass[id]` is the penalty pass in which token `id` was last
+    /// penalized. Comparing against `pass` lets one scan of `history` penalize each distinct token
+    /// exactly once without re-zeroing this vocab-sized buffer every step.
+    last_pass: Vec<u64>,
+    /// Monotonic counter bumped once per penalized `sample` call — i.e. the current penalty pass.
+    pass: u64,
 }
 
 impl Sampler {
     pub fn new(temperature: f32, top_k: usize, repeat_penalty: f32, seed: u64) -> Self {
-        Self { temperature, top_k, repeat_penalty, rng: seed | 1, cand: Vec::new() }
+        Self {
+            temperature,
+            top_k,
+            repeat_penalty,
+            rng: seed | 1,
+            cand: Vec::new(),
+            last_pass: Vec::new(),
+            pass: 0,
+        }
     }
 
     /// Deterministic greedy decoding (argmax, no penalty).
@@ -41,10 +56,22 @@ impl Sampler {
     /// `history` is the tokens generated/seen so far (for the repetition penalty).
     pub fn sample(&mut self, logits: &mut [f32], history: &[u32]) -> u32 {
         if self.repeat_penalty != 1.0 {
+            // Presence-based: penalize each *distinct* token in `history` once, never compounded
+            // per occurrence (matching HF transformers / llama.cpp). One pass over `history`,
+            // skipping tokens already stamped with this call's number — so no allocation and no
+            // vocab-sized clear per step; this keeps the cost the same as a plain history scan.
+            self.pass += 1;
+            if self.last_pass.len() < logits.len() {
+                self.last_pass.resize(logits.len(), 0);
+            }
             for &tok in history {
-                let l = &mut logits[tok as usize];
-                // llama.cpp convention: divide if positive, multiply if negative.
-                *l = if *l > 0.0 { *l / self.repeat_penalty } else { *l * self.repeat_penalty };
+                let last = &mut self.last_pass[tok as usize];
+                if *last != self.pass {
+                    *last = self.pass;
+                    let l = &mut logits[tok as usize];
+                    // llama.cpp convention: divide if positive, multiply if negative.
+                    *l = if *l > 0.0 { *l / self.repeat_penalty } else { *l * self.repeat_penalty };
+                }
             }
         }
 
@@ -139,6 +166,16 @@ mod tests {
         let mut s = Sampler::new(0.0, 0, 2.0, 0);
         let mut logits = [-1.0f32, -1.5];
         assert_eq!(s.sample(&mut logits, &[0]), 1);
+    }
+
+    #[test]
+    fn repeat_penalty_is_presence_based_not_compounded() {
+        // A token repeated in history is penalized once, not once per occurrence. With penalty
+        // 2.0 and token 0 appearing twice, presence-based gives 10/2 = 5, still the argmax; a
+        // compounding penalty would give 10/4 = 2.5 and wrongly flip the argmax to token 1.
+        let mut s = Sampler::new(0.0, 0, 2.0, 0);
+        let mut logits = [10.0f32, 4.0, 1.0];
+        assert_eq!(s.sample(&mut logits, &[0, 0]), 0);
     }
 
     #[test]
