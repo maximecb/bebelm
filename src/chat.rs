@@ -65,20 +65,29 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
             println!(); // Terminate the prompt line on Ctrl-D.
             break;
         }
-        let msg = line.trim();
-        if msg.is_empty() {
+        let input = line.trim();
+        if input.is_empty() {
             continue;
         }
-        if msg == "/exit" || msg == "/quit" {
+        if input == "/exit" || input == "/quit" {
             break;
         }
 
-        agent.append_user(msg);
+        // Expand any `@path` file references into inline fenced blocks before sending.
+        let msg = match expand_file_refs(input) {
+            Ok(msg) => msg,
+            Err(err) => {
+                eprintln!("{}{err}{}", pal.dim, pal.reset);
+                continue;
+            }
+        };
+
+        agent.append_user(&msg);
 
         // Blank line between the user's message and the model's reply.
         println!();
 
-        // Stream the reply. The model opens with a <think>…</think> reasoning block; colour
+        // Stream the reply. The model opens with a <think>...</think> reasoning block; colour
         // that distinctly from the answer that follows. Start in the answer colour so a reply
         // with no <think> block still reads correctly.
         print!("{}", pal.answer);
@@ -106,4 +115,38 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
     }
 
     Ok(())
+}
+
+/// Expand `@path` file references in a typed line. The line is left untouched and the
+/// contents of each referenced file are appended after it as fenced blocks, with the
+/// path as the info string. Each whitespace-delimited word starting with `@` names a
+/// file; duplicates are included once. Returns an error string if a referenced file
+/// can't be read (which also rejects directories) or isn't valid UTF-8; a bare `@` or a
+/// line with no references is returned unchanged.
+fn expand_file_refs(line: &str) -> Result<String, String> {
+    let mut blocks = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+
+    for word in line.split_whitespace() {
+        let Some(path) = word.strip_prefix('@') else { continue };
+        if path.is_empty() || seen.contains(&path) {
+            continue;
+        }
+        seen.push(path);
+        let bytes = std::fs::read(path).map_err(|e| format!("@{path}: {e}"))?;
+        let text = String::from_utf8(bytes).map_err(|_| format!("@{path}: not valid UTF-8"))?;
+        blocks.push_str("\n```");
+        blocks.push_str(path);
+        blocks.push('\n');
+        blocks.push_str(&text);
+        if !text.ends_with('\n') {
+            blocks.push('\n');
+        }
+        blocks.push_str("```\n");
+    }
+
+    if blocks.is_empty() {
+        return Ok(line.to_string());
+    }
+    Ok(format!("{line}\n{blocks}"))
 }
