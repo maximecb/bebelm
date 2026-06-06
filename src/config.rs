@@ -107,6 +107,114 @@ fn expect_f32(g: &GgufFile, key: &str, want: f32, tol: f32) -> Result<(), Box<dy
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gguf::GgufFile;
+
+    // GGUF metadata value-type discriminants (see gguf::ValueType).
+    const VT_U32: u32 = 4;
+    const VT_F32: u32 = 6;
+    const VT_STRING: u32 = 8;
+    const VT_ARRAY: u32 = 9;
+
+    fn push_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+    fn kv_str(buf: &mut Vec<u8>, key: &str, val: &str) {
+        push_str(buf, key);
+        buf.extend_from_slice(&VT_STRING.to_le_bytes());
+        push_str(buf, val);
+    }
+    fn kv_u32(buf: &mut Vec<u8>, key: &str, val: u32) {
+        push_str(buf, key);
+        buf.extend_from_slice(&VT_U32.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+    fn kv_f32(buf: &mut Vec<u8>, key: &str, val: f32) {
+        push_str(buf, key);
+        buf.extend_from_slice(&VT_F32.to_le_bytes());
+        buf.extend_from_slice(&val.to_bits().to_le_bytes());
+    }
+    fn kv_u32_array(buf: &mut Vec<u8>, key: &str, vals: &[u32]) {
+        push_str(buf, key);
+        buf.extend_from_slice(&VT_ARRAY.to_le_bytes());
+        buf.extend_from_slice(&VT_U32.to_le_bytes());
+        buf.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        for &v in vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// The kv-head schedule the real file carries: `N_KV_HEADS` on attention layers, 0 else.
+    fn valid_schedule() -> Vec<u32> {
+        (0..N_LAYERS).map(|i| if is_attention(i) { N_KV_HEADS as u32 } else { 0 }).collect()
+    }
+
+    /// A minimal (tensor-free) GGUF whose metadata matches the hardcoded config, except for
+    /// the `arch`, `block_count`, and kv-head `schedule` knobs the rejection tests vary.
+    fn build_gguf(arch: &str, block_count: u32, schedule: &[u32]) -> Vec<u8> {
+        let mut kvs = Vec::new();
+        let mut n = 0u64;
+        let mut u32_kv = |k: &str, v: u32| {
+            kv_u32(&mut kvs, k, v);
+            n += 1;
+        };
+        u32_kv("lfm2moe.block_count", block_count);
+        u32_kv("lfm2moe.embedding_length", HIDDEN as u32);
+        u32_kv("lfm2moe.vocab_size", VOCAB as u32);
+        u32_kv("lfm2moe.attention.head_count", N_HEADS as u32);
+        u32_kv("lfm2moe.expert_count", N_EXPERTS as u32);
+        u32_kv("lfm2moe.expert_used_count", N_EXPERTS_USED as u32);
+        u32_kv("lfm2moe.feed_forward_length", DENSE_FF as u32);
+        u32_kv("lfm2moe.expert_feed_forward_length", MOE_FF as u32);
+        u32_kv("lfm2moe.leading_dense_block_count", N_DENSE_LAYERS as u32);
+        u32_kv("lfm2moe.shortconv.l_cache", CONV_L_CACHE as u32);
+
+        kv_str(&mut kvs, "general.architecture", arch);
+        kv_f32(&mut kvs, "lfm2moe.rope.freq_base", ROPE_THETA);
+        kv_f32(&mut kvs, "lfm2moe.attention.layer_norm_rms_epsilon", RMS_EPS);
+        kv_u32_array(&mut kvs, "lfm2moe.attention.head_count_kv", schedule);
+        n += 4;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&n.to_le_bytes()); // kv_count
+        buf.extend_from_slice(&kvs);
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    fn parse(bytes: Vec<u8>) -> GgufFile {
+        GgufFile::from_bytes(bytes).unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_matching_metadata() {
+        let g = parse(build_gguf(ARCH, N_LAYERS as u32, &valid_schedule()));
+        assert!(validate(&g).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_architecture() {
+        let g = parse(build_gguf("llama", N_LAYERS as u32, &valid_schedule()));
+        assert!(validate(&g).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_block_count() {
+        let g = parse(build_gguf(ARCH, 12, &valid_schedule()));
+        assert!(validate(&g).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_schedule_mismatch() {
+        // All-zero kv heads contradicts ATTENTION_LAYERS (which expect N_KV_HEADS on those).
+        let g = parse(build_gguf(ARCH, N_LAYERS as u32, &[0u32; N_LAYERS]));
+        assert!(validate(&g).is_err());
+    }
 
     #[test]
     fn schedule_predicates() {

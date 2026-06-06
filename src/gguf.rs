@@ -551,4 +551,109 @@ mod tests {
         buf.truncate(10);
         assert!(GgufFile::from_bytes(buf).is_err());
     }
+
+    #[test]
+    fn rejects_unsupported_version() {
+        let mut buf = build_sample();
+        buf[4..8].copy_from_slice(&5u32.to_le_bytes()); // version field follows the 4-byte magic
+        assert!(matches!(GgufFile::from_bytes(buf), Err(GgufError::UnsupportedVersion(5))));
+    }
+
+    /// A header with `tensor_count` tensors and `kv_count` kvs, followed by `body` (the kv +
+    /// tensor-table bytes the caller appends) and padding to the 32-byte alignment.
+    fn header(tensor_count: u64, kv_count: u64, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&tensor_count.to_le_bytes());
+        buf.extend_from_slice(&kv_count.to_le_bytes());
+        buf.extend_from_slice(body);
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn rejects_unknown_value_type() {
+        let mut body = Vec::new();
+        push_str(&mut body, "weird");
+        body.extend_from_slice(&99u32.to_le_bytes()); // out-of-range value type
+        assert!(matches!(
+            GgufFile::from_bytes(header(0, 1, &body)),
+            Err(GgufError::UnknownValueType(99))
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_tensor_type() {
+        let mut body = Vec::new();
+        push_str(&mut body, "weird");
+        body.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+        body.extend_from_slice(&1u64.to_le_bytes()); // dim0
+        body.extend_from_slice(&1000u32.to_le_bytes()); // unmodeled ggml type
+        body.extend_from_slice(&0u64.to_le_bytes()); // offset
+        assert!(matches!(
+            GgufFile::from_bytes(header(1, 0, &body)),
+            Err(GgufError::UnknownTensorType { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_tensor_out_of_bounds() {
+        // A tensor claiming 1024 F32 elements (4 KiB) with no tensor data in the file.
+        let mut body = Vec::new();
+        push_str(&mut body, "big");
+        body.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+        body.extend_from_slice(&1024u64.to_le_bytes()); // dim0
+        body.extend_from_slice(&0u32.to_le_bytes()); // F32
+        body.extend_from_slice(&0u64.to_le_bytes()); // offset
+        assert!(matches!(
+            GgufFile::from_bytes(header(1, 0, &body)),
+            Err(GgufError::TensorOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn reads_custom_alignment() {
+        // `general.alignment` overrides the 32-byte default for the data section.
+        let mut body = Vec::new();
+        push_str(&mut body, "general.alignment");
+        body.extend_from_slice(&(ValueType::U32 as u32).to_le_bytes());
+        body.extend_from_slice(&8u32.to_le_bytes());
+        let g = GgufFile::from_bytes(header(0, 1, &body)).unwrap();
+        assert_eq!(g.alignment, 8);
+    }
+
+    #[test]
+    fn accessors_widen_integer_and_float_types() {
+        // get_u32 widens any integer type; get_f32 widens F64; get_u32_array widens an
+        // integer-typed array (e.g. the per-layer kv-head counts stored as I16/I32).
+        let mut body = Vec::new();
+        push_str(&mut body, "k.u8");
+        body.extend_from_slice(&(ValueType::U8 as u32).to_le_bytes());
+        body.push(7);
+
+        push_str(&mut body, "k.i64");
+        body.extend_from_slice(&(ValueType::I64 as u32).to_le_bytes());
+        body.extend_from_slice(&123i64.to_le_bytes());
+
+        push_str(&mut body, "k.f64");
+        body.extend_from_slice(&(ValueType::F64 as u32).to_le_bytes());
+        body.extend_from_slice(&2.5f64.to_bits().to_le_bytes());
+
+        push_str(&mut body, "k.i16arr");
+        body.extend_from_slice(&(ValueType::Array as u32).to_le_bytes());
+        body.extend_from_slice(&(ValueType::I16 as u32).to_le_bytes());
+        body.extend_from_slice(&3u64.to_le_bytes());
+        for v in [10i16, 0, 8] {
+            body.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let g = GgufFile::from_bytes(header(0, 4, &body)).unwrap();
+        assert_eq!(g.get_u32("k.u8"), Some(7));
+        assert_eq!(g.get_u32("k.i64"), Some(123));
+        assert_eq!(g.get_f32("k.f64"), Some(2.5));
+        assert_eq!(g.get_u32_array("k.i16arr"), Some(vec![10, 0, 8]));
+    }
 }

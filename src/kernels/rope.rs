@@ -52,6 +52,20 @@ mod tests {
     }
 
     #[test]
+    fn pairs_split_half_not_interleaved() {
+        // head_dim = 4 -> half = 2, so index i pairs with i+2 (NEOX split-half), not the
+        // adjacent i+1 of interleaved RoPE. x = [1,0,0,0] at pos 1: pair (0,2) rotates by
+        // angle pos·scale^0 = 1 rad, pair (1,3) stays zero. The rotated sine lands at index
+        // 2 (the partner), not index 1 — which is what distinguishes the two conventions.
+        let mut x = [1.0f32, 0.0, 0.0, 0.0];
+        rope_neox(&mut x, 1, THETA);
+        assert!((x[0] - 1.0f32.cos()).abs() < 1e-6, "x0 = {}", x[0]);
+        assert!((x[2] - 1.0f32.sin()).abs() < 1e-6, "x2 = {}", x[2]);
+        assert_eq!(x[1], 0.0);
+        assert_eq!(x[3], 0.0);
+    }
+
+    #[test]
     fn preserves_vector_norm() {
         // RoPE is a rotation, so the L2 norm is unchanged.
         let orig = [0.5f32, -1.5, 2.0, 0.25, -0.75, 1.1, 0.9, -0.4];

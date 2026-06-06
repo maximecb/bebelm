@@ -451,4 +451,64 @@ mod tests {
         let ids = toy().encode("hello", false);
         assert_eq!(ids, "hello".bytes().map(u32::from).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn pretokenize_newlines_and_trailing_space() {
+        assert_eq!(pt("a\nb"), ["a", "\n", "b"]);
+        assert_eq!(pt("hi\n\n"), ["hi", "\n\n"]); // a newline run stays one piece
+        assert_eq!(pt("hi "), ["hi", " "]); // a trailing space at end-of-text is its own piece
+    }
+
+    /// A tokenizer with a full byte-char vocab (id == byte value), the given merge rules
+    /// (in priority order, rank 0 = highest), and any extra whole-token strings appended.
+    /// Enough to exercise the BPE merge loop and `encode`↔`decode` byte round-tripping.
+    fn toy_bpe(merges: &[(&str, &str)], extra: &[&str]) -> Tokenizer {
+        let byte_encoder = byte_to_unicode();
+        let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
+        let mut id_to_token: Vec<String> = (0..256).map(|b| byte_encoder[b].to_string()).collect();
+        id_to_token.extend(extra.iter().map(|s| s.to_string()));
+        let token_to_id =
+            id_to_token.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+        let merge_rank = merges
+            .iter()
+            .enumerate()
+            .map(|(rank, (a, b))| ((a.to_string(), b.to_string()), rank as u32))
+            .collect();
+        Tokenizer {
+            id_to_token,
+            token_to_id,
+            merge_rank,
+            specials: Vec::new(),
+            byte_encoder,
+            byte_decoder,
+            bos: 2,
+            eos: 1001,
+        }
+    }
+
+    #[test]
+    fn bpe_merges_lowest_rank_pair_first() {
+        // (b,c) is rank 0, (a,b) rank 1. In "abc" the higher-priority (b,c) merges first —
+        // even though (a,b) is the leftmost pair — giving ["a", "bc"], not ["ab", "c"].
+        let tok = toy_bpe(&[("b", "c"), ("a", "b")], &["bc", "ab"]);
+        assert_eq!(tok.encode("abc", false), [b'a' as u32, 256]); // "bc" is the first extra
+    }
+
+    #[test]
+    fn bpe_applies_chained_merges() {
+        // (a,b)->ab rank 0, then (ab,c)->abc rank 1: "abc" collapses to one token.
+        let tok = toy_bpe(&[("a", "b"), ("ab", "c")], &["ab", "abc"]);
+        assert_eq!(tok.encode("abc", false), [257]); // "abc" is the 2nd extra -> id 257
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_plain_text() {
+        // With id == byte value and no merges, byte-level encode/decode is the identity on
+        // arbitrary text, including multibyte UTF-8 (mapped through the byte table per byte).
+        let tok = toy_bpe(&[], &[]);
+        for s in ["hello world", "café ☕", "a\nb\tc", "  spaced  "] {
+            let ids = tok.encode(s, false);
+            assert_eq!(tok.decode(&ids), s, "roundtrip {s:?}");
+        }
+    }
 }

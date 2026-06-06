@@ -252,6 +252,15 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_f16_tensor() {
+        // The F16 tensor path (chunks_exact(2) -> f16_to_f32). Bit patterns: 1, 2, -2, 0.5.
+        let data: Vec<u8> =
+            [0x3c00u16, 0x4000, 0xc000, 0x3800].iter().flat_map(|h| h.to_le_bytes()).collect();
+        let out = dequantize(GgmlType::F16, &data, 4);
+        assert_eq!(out, vec![1.0, 2.0, -2.0, 0.5]);
+    }
+
+    #[test]
     fn dispatch_two_q4k_blocks() {
         // Two identical blocks -> 512 outputs, second mirrors the first.
         let mut block = vec![0u8; Q4_K_BYTES];

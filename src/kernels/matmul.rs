@@ -422,6 +422,24 @@ mod tests {
     }
 
     #[test]
+    fn dot_covers_simd_and_tail_lengths() {
+        // `dot_basic` only reaches the scalar tail (len 3). These lengths exercise the
+        // 32-wide 4-accumulator loop, the 8-wide loop, and their seams with the tail.
+        // The SIMD reduction reorders the sum (FMA rounding), so compare to a plain
+        // left-to-right dot with tolerance rather than bit-for-bit.
+        fn scalar_dot(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(&x, &y)| x * y).sum()
+        }
+        for n in [8usize, 11, 16, 19, 32, 35, 40, 64, 100] {
+            let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1 - 1.0).collect();
+            let b: Vec<f32> = (0..n).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
+            let got = dot(&a, &b);
+            let want = scalar_dot(&a, &b);
+            assert!((got - want).abs() <= 1e-4 * want.abs().max(1.0), "n={n}: {got} vs {want}");
+        }
+    }
+
+    #[test]
     fn matvec_f32_small() {
         // W = [in=2, out=3], rows (by output) [1,2], [3,4], [5,6]; x = [1,1].
         let w = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -519,5 +537,102 @@ mod tests {
         let mut y = [0.0f32; 1];
         matvec(GgmlType::Q4_K, &block, 256, 1, &x, &mut y);
         assert_eq!(y[0], 7.0);
+    }
+
+    #[test]
+    fn matvec_f16_small() {
+        // Same shape as `matvec_f32_small`, but the weights are F16 (the dequant-into-scratch
+        // path). f16 bit patterns for rows [1,2], [3,4], [5,6]; x = [1,1] -> [3, 7, 11].
+        let halves = [0x3c00u16, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600]; // 1,2,3,4,5,6
+        let w: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let x = [1.0f32, 1.0];
+        let mut y = [0.0f32; 3];
+        matvec(GgmlType::F16, &w, 2, 3, &x, &mut y);
+        assert_eq!(y, [3.0, 7.0, 11.0]);
+    }
+
+    #[test]
+    fn matvec_parallel_path_matches_per_row_dot() {
+        // n_out >= PAR_MIN_ROWS forces the rayon path. Each output row is an independent
+        // dot, so the result must be bit-for-bit equal to dotting each weight row with x
+        // directly — exactly what the serial path computes (the module's threading claim).
+        let n_in = 40usize; // 32 + 8: drives the SIMD dot too
+        let n_out = 128usize; // > PAR_MIN_ROWS (64)
+        let w: Vec<f32> = (0..n_in * n_out).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let x: Vec<f32> = (0..n_in).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let mut y = vec![0.0f32; n_out];
+        matvec(GgmlType::F32, &f32_bytes(&w), n_in, n_out, &x, &mut y);
+        for (o, &yo) in y.iter().enumerate() {
+            assert_eq!(yo, dot(&w[o * n_in..(o + 1) * n_in], &x), "row {o}");
+        }
+    }
+
+    /// A Q4_K weight matrix of `n_out` rows (each one 256-weight block), bytes varied by row.
+    fn q4k_matrix(n_out: usize, seed: usize) -> Vec<u8> {
+        let mut w = Vec::with_capacity(n_out * 144);
+        for r in 0..n_out {
+            let mut block = vec![0u8; 144];
+            block[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
+            block[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // dmin = 0.25
+            for (j, b) in block[4..16].iter_mut().enumerate() {
+                *b = ((r + seed) * 7 + j * 17 + 5) as u8;
+            }
+            for (i, b) in block[16..144].iter_mut().enumerate() {
+                *b = ((r + seed) * 3 + i * 37 + 11) as u8;
+            }
+            w.extend_from_slice(&block);
+        }
+        w
+    }
+
+    /// A Q6_K weight matrix of `n_out` rows (each one 256-weight block), bytes varied by row.
+    fn q6k_matrix(n_out: usize, seed: usize) -> Vec<u8> {
+        let mut w = Vec::with_capacity(n_out * 210);
+        for r in 0..n_out {
+            let mut block = vec![0u8; 210];
+            block[208..210].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
+            for (i, b) in block[0..128].iter_mut().enumerate() {
+                *b = ((r + seed) * 5 + i * 53 + 17) as u8; // ql
+            }
+            for (i, b) in block[128..192].iter_mut().enumerate() {
+                *b = ((r + seed) * 11 + i * 97 + 5) as u8; // qh
+            }
+            for (j, b) in block[192..208].iter_mut().enumerate() {
+                *b = ((r + seed).wrapping_mul(29).wrapping_add(j * 13 + 3)) as u8; // i8 scales
+            }
+            w.extend_from_slice(&block);
+        }
+        w
+    }
+
+    #[test]
+    fn matvec_fused_batch_matches_separate_jobs() {
+        // A batch must write each job's rows at its running offset, identical to running the
+        // jobs one at a time via fused_row_dot (bit-for-bit — same per-row code). Two dtypes
+        // span differing row strides (144 vs 210 B), so the partition_point row attribution
+        // is exercised across them; two sizes hit both the serial and parallel branches.
+        let x1: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let x2: Vec<f32> = (0..256).map(|i| ((i % 5) as f32 - 2.0) * 0.07).collect();
+
+        // (3,5): total 8 < PAR_MIN_ROWS -> serial. (40,50): total 90 -> parallel.
+        for &(n_a, n_b) in &[(3usize, 5usize), (40usize, 50usize)] {
+            let wa = q4k_matrix(n_a, 1);
+            let wb = q6k_matrix(n_b, 99);
+            let jobs = vec![
+                FusedJob { dtype: GgmlType::Q4_K, w: &wa, n_in: 256, n_out: n_a, x: &x1 },
+                FusedJob { dtype: GgmlType::Q6_K, w: &wb, n_in: 256, n_out: n_b, x: &x2 },
+            ];
+            let mut out = vec![0.0f32; n_a + n_b];
+            matvec_fused_batch(&jobs, &mut out);
+
+            for o in 0..n_a {
+                let row = &wa[o * 144..(o + 1) * 144];
+                assert_eq!(out[o], fused_row_dot(GgmlType::Q4_K, row, &x1), "job A row {o}");
+            }
+            for o in 0..n_b {
+                let row = &wb[o * 210..(o + 1) * 210];
+                assert_eq!(out[n_a + o], fused_row_dot(GgmlType::Q6_K, row, &x2), "job B row {o}");
+            }
+        }
     }
 }

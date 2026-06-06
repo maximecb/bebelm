@@ -132,6 +132,16 @@ mod tests {
     }
 
     #[test]
+    fn repeat_penalty_demotes_negative_seen_token() {
+        // Negative logits are *multiplied* by the penalty (not divided), pushing seen tokens
+        // further down. token 0 leads at -1.0; in history it becomes -1.0*2 = -2.0 < -1.5,
+        // so the argmax flips to token 1.
+        let mut s = Sampler::new(0.0, 0, 2.0, 0);
+        let mut logits = [-1.0f32, -1.5];
+        assert_eq!(s.sample(&mut logits, &[0]), 1);
+    }
+
+    #[test]
     fn top_k_1_is_greedy_even_with_temperature() {
         let mut s = Sampler::new(1.0, 1, 1.0, 12345);
         let mut logits = [0.5f32, 2.0, 1.0];
