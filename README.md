@@ -6,7 +6,8 @@ model to run at interactive speeds without a GPU.
 
 This package intentionally has very few dependencies and requires no extra system
 packages to run, making it easy to build and run.
-This is a library crate so the model can be imported. There is also a basic command-line
+This is a library crate which can be imported into your Rust projects, and it's now available
+via [crates.io](https://crates.io/crates/bebelm). There is also a basic command-line
 interface that you can use.
 
 BebeLM was tested on an M5 CPU as well as Ryzen 7x and Threadripper CPUs. It should work
@@ -23,7 +24,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update
 ```
 
-Running also requires the ~5.2 GB Q4_K_M GGUF. Download it:
+Running also requires downloading the ~5.2 GB Q4_K_M model weights:
 
 ```sh
 curl -L -o LFM2.5-8B-A1B-Q4_K_M.gguf \
@@ -44,9 +45,6 @@ Install the CLI from crates.io — this puts a `bebelm` binary on your `PATH`:
 ```sh
 cargo install bebelm
 ```
-
-On x86, use `RUSTFLAGS="-C target-cpu=native" cargo install bebelm` for AVX2 + FMA (see
-**CPU / SIMD build**); Apple Silicon needs no flags.
 
 ### Development setup
 
@@ -208,9 +206,7 @@ are public if you want to drive decoding yourself.
 
 The x86 SIMD kernels are tuned for the machine you build on: `.cargo/config.toml` sets
 `target-cpu=native`, so a build automatically uses **AVX2 + FMA** when the CPU has them
-and falls back to whatever it supports otherwise. (Without this the default
-x86_64 target is SSE2-only and runs the vector dot products at half width.) arm64 (Apple
-Silicon / NEON) is unaffected and needs no flags.
+and falls back to whatever it supports otherwise.
 
 Because `native` targets the build host, a binary built on an AVX2 machine may fault on an
 older CPU. To build a portable binary, override the CPU target via `RUSTFLAGS` (it takes
