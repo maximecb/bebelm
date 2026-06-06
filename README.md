@@ -10,6 +10,9 @@ packages to run, making it easy to build and run.
 This is a library crate so the model can be imported. There is also a basic command-line
 interface that you can use.
 
+BebeLM was tested on an M5 CPU as well as Ryzen 7x and Threadripper CPUs. It should work
+on Intel and on Raspberry Pi 4/5 as well, but this is untested.
+
 ### Setup instructions
 
 Install cargo or update your rust toolchain:
