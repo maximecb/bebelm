@@ -206,3 +206,34 @@ RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
 
 The instruction set is chosen at build time; there is no single binary that switches at
 runtime.
+
+### Running the tests
+
+The test suite has two layers:
+
+- **Fast unit tests** run with plain `cargo test` — they need no model file and finish in
+  seconds, so they are the default and what CI runs first.
+- **End-to-end tests** (`tests/end_to_end.rs`) load the full ~5.2 GB Q4_K_M GGUF and run real
+  generation against it. They are gated behind `#[ignore]` so `cargo test` stays model-free, and
+  they read the weights path from `BEBELM_WEIGHTS_FILE` (defaulting to the repo-root GGUF, same
+  resolution as the CLI — see **Setup instructions** for downloading it).
+
+Run the **full** end-to-end suite — every `#[ignore]`d test — with `--ignored`:
+
+```sh
+cargo test --release -- --ignored
+```
+
+Each test loads the model independently and runs real decoding, so the full suite is slow. For
+a quick **partial** run, append a test-name filter (a substring match) — e.g. the single
+Paris-completion smoke test, the fastest one:
+
+```sh
+# one end-to-end test (fast smoke check)
+cargo test --release -- --ignored capital_of_france_is_paris
+```
+
+A broader substring targets a group, e.g. `cargo test --release -- --ignored multi_turn`. List
+the available end-to-end tests without running them with
+`cargo test --release -- --ignored --list`. Always use `--release`: a debug build runs the
+numeric kernels far slower.
