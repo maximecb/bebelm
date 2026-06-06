@@ -6,14 +6,13 @@
 //! the model with [`Agent::generate`] — or the [`Agent::assistant_turn`] convenience, which
 //! wraps the ChatML assistant framing around a single `generate`.
 
-use std::error::Error;
 use std::time::{Duration, Instant};
 
 use crate::cache::Cache;
 use crate::model::Model;
 use crate::sampler::Sampler;
 use crate::tokenizer::{
-    Tokenizer, TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD, TOKEN_THINK,
+    TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD, TOKEN_THINK,
     TOKEN_THINK_END,
 };
 
@@ -77,7 +76,6 @@ pub struct Turn {
 /// so one loaded model can back several independent agents.
 pub struct Agent<'m> {
     model: &'m Model,
-    tok: Tokenizer,
     cache: Cache,
     sampler: Sampler,
     /// The full token transcript (every turn so far). `cache.pos` of these have already been
@@ -91,20 +89,18 @@ pub struct Agent<'m> {
 }
 
 impl<'m> Agent<'m> {
-    /// Create an agent over `model`, building its tokenizer from the same GGUF. Starts with
-    /// Liquid's recommended sampling and a 32K context cap; override via the builder methods.
-    pub fn new(model: &'m Model) -> Result<Self, Box<dyn Error>> {
-        let tok = Tokenizer::from_gguf(model.gguf())?;
-        Ok(Agent {
+    /// Create an agent over `model`. Starts with Liquid's recommended sampling and a 32K
+    /// context cap; override via the builder methods.
+    pub fn new(model: &'m Model) -> Self {
+        Agent {
             model,
-            tok,
             cache: Cache::new(),
             sampler: Sampler::recommended(),
             history: Vec::new(),
             max_gen: DEFAULT_MAX_GEN,
             max_context: DEFAULT_MAX_CONTEXT,
             max_think: usize::MAX,
-        })
+        }
     }
 
     // --- Builder-style configuration ---
@@ -159,7 +155,7 @@ impl<'m> Agent<'m> {
     /// the first append (while the transcript is still empty).
     pub fn append(&mut self, text: &str) {
         let add_bos = self.history.is_empty();
-        let ids = self.tok.encode(text, add_bos);
+        let ids = self.model.tokenizer().encode(text, add_bos);
         self.history.extend(ids);
     }
 
@@ -228,7 +224,7 @@ impl<'m> Agent<'m> {
                 logits[TOKEN_THINK as usize] = f32::NEG_INFINITY;
             }
             if require_answer {
-                logits[self.tok.eos as usize] = f32::NEG_INFINITY;
+                logits[self.model.tokenizer().eos as usize] = f32::NEG_INFINITY;
                 for &t in &STOP_TOKENS {
                     logits[t as usize] = f32::NEG_INFINITY;
                 }
@@ -242,7 +238,7 @@ impl<'m> Agent<'m> {
             } else {
                 self.sampler.sample(&mut logits, &self.history)
             };
-            if next == self.tok.eos || STOP_TOKENS.contains(&next) {
+            if next == self.model.tokenizer().eos || STOP_TOKENS.contains(&next) {
                 break StopReason::Eos;
             }
             match next {
@@ -257,7 +253,7 @@ impl<'m> Agent<'m> {
                 _ if thinking => think_count += 1,
                 _ => {}
             }
-            let text = self.tok.decode(&[next]);
+            let text = self.model.tokenizer().decode(&[next]);
             on_token(next, &text);
             ids.push(next);
             self.history.push(next);
@@ -270,7 +266,7 @@ impl<'m> Agent<'m> {
         };
         let decode = t_decode.elapsed();
 
-        let text = self.tok.decode(&ids);
+        let text = self.model.tokenizer().decode(&ids);
         let stats = GenStats {
             prompt_tokens: pending,
             generated_tokens: ids.len(),

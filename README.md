@@ -101,7 +101,7 @@ use bebelm::model::Model;
 let model = Model::load("LFM2.5-8B-A1B-Q4_K_M.gguf")?;
 
 // An agent borrows the model — the ~5.2 GB of weights are shared, so several agents are cheap.
-let mut agent = Agent::new(&model)?;
+let mut agent = Agent::new(&model);
 
 agent.append_user("What is the capital of France?");
 let turn = agent.assistant_turn(|_, _| {});   // generate the whole reply at once
@@ -117,7 +117,7 @@ Here `|_, _| {}` is a do-nothing token callback, so the whole reply is just coll
 `turn.text`. To instead stream tokens as they are generated, pass a real callback — see
 **Generating** below.
 
-**Configuration** — builder methods chained after `Agent::new(..)?` (sampling defaults to the
+**Configuration** — builder methods chained after `Agent::new(..)` (sampling defaults to the
 model's recommended temperature 0.2 / top-k 80 / repeat-penalty 1.05):
 
 - `.greedy()` — deterministic argmax decoding.
@@ -143,7 +143,7 @@ callback:
   completion:
 
 ```rust
-let mut agent = Agent::new(&model)?;
+let mut agent = Agent::new(&model);
 agent.append("The capital of France is");
 let turn = agent.generate(|_, _| {});      // raw continuation; turn.text = " the city of Paris…"
 println!("The capital of France is{}", turn.text);

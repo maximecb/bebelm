@@ -58,7 +58,7 @@ fn cmd_generate(path: &str, args: &[String]) -> Cmd {
     }
 
     let model = Model::load(path)?;
-    let mut agent = opts.apply(Agent::new(&model)?);
+    let mut agent = opts.apply(Agent::new(&model));
     agent.append(&text);
     let prompt = agent.history().to_vec();
     eprintln!("prompt = {} tokens; generating (cached, multi-threaded)...", prompt.len());

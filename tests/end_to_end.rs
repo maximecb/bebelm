@@ -32,7 +32,7 @@ fn load_model() -> Model {
 fn capital_of_france_is_paris() {
     let model = load_model();
 
-    let mut agent = Agent::new(&model).expect("build agent").greedy().max_gen(8);
+    let mut agent = Agent::new(&model).greedy().max_gen(8);
     agent.append("The capital of France is");
     let turn = agent.generate(|_id, _piece| {});
 
@@ -56,7 +56,7 @@ fn csv_to_markdown_table() {
 
     // `--no-think` (max_think 0): answer directly instead of opening a reasoning block, so the
     // table is the whole reply and a modest token budget suffices.
-    let mut agent = Agent::new(&model).expect("build agent").greedy().max_think(200).max_gen(200);
+    let mut agent = Agent::new(&model).greedy().max_think(200).max_gen(200);
     agent.append_user(&format!(
         "Convert the following CSV into a Markdown table. Output only the table.\n\n```csv\n{csv}```"
     ));
@@ -92,7 +92,7 @@ fn markdown_table_to_html() {
 
     // `--no-think` (max_think 0): answer directly instead of opening a reasoning block, so the
     // table is the whole reply and a modest token budget suffices.
-    let mut agent = Agent::new(&model).expect("build agent").greedy().max_think(200).max_gen(200);
+    let mut agent = Agent::new(&model).greedy().max_think(200).max_gen(200);
     agent.append_user(&format!(
         "Convert the following Markdown table into an HTML table. Output only the HTML.\n\n{markdown}"
     ));
@@ -121,7 +121,7 @@ fn markdown_table_to_html() {
 fn greedy_decoding_is_deterministic() {
     let model = load_model();
     let run = || {
-        let mut agent = Agent::new(&model).expect("build agent").greedy().max_think(200).max_gen(32);
+        let mut agent = Agent::new(&model).greedy().max_think(200).max_gen(32);
         agent.append_user("List three primary colors, one per line.");
         agent.assistant_turn(|_id, _piece| {}).ids
     };
@@ -139,7 +139,7 @@ fn greedy_decoding_is_deterministic() {
 #[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
 fn multi_turn_remembers_context() {
     let model = load_model();
-    let mut agent = Agent::new(&model).expect("build agent").greedy().max_think(200).max_gen(64);
+    let mut agent = Agent::new(&model).greedy().max_think(200).max_gen(64);
 
     agent.append_user("My name is Quentin. Please remember it.");
     agent.assistant_turn(|_id, _piece| {});

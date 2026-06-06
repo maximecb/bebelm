@@ -49,7 +49,7 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
         return Err(format!("chat takes no prompt arguments; got {positional:?}").into());
     }
     let model = Model::load(path)?;
-    let mut agent = opts.apply(Agent::new(&model)?);
+    let mut agent = opts.apply(Agent::new(&model));
     let pal = Palette::detect();
 
     eprintln!("Chat ready. Type a message. Input Ctrl-D or /exit to quit.\n");

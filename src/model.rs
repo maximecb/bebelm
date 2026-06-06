@@ -20,6 +20,7 @@ use crate::kernels::matmul::{matvec, matvec_fused_batch, quantize_q8, FusedJob, 
 use crate::kernels::rmsnorm::rmsnorm;
 use crate::kernels::rope::rope_neox;
 use crate::tensor::GgmlType;
+use crate::tokenizer::Tokenizer;
 
 /// A loaded, validated model: the mmapped GGUF plus a name → tensor index, plus the small
 /// F32 tensors (norm gains, conv filters, expert biases) pre-dequantized once (9b).
@@ -27,6 +28,7 @@ pub struct Model {
     gguf: GgufFile,
     by_name: HashMap<String, usize>,
     f32_cache: HashMap<String, Vec<f32>>,
+    tokenizer: Tokenizer,
 }
 
 impl Model {
@@ -40,7 +42,8 @@ impl Model {
             .enumerate()
             .map(|(i, t)| (t.name.clone(), i))
             .collect();
-        let mut model = Model { gguf, by_name, f32_cache: HashMap::new() };
+        let tokenizer = Tokenizer::from_gguf(&gguf)?;
+        let mut model = Model { gguf, by_name, f32_cache: HashMap::new(), tokenizer };
         model.check_tensors()?;
         model.precompute_f32();
         Ok(model)
@@ -82,9 +85,9 @@ impl Model {
         self.gguf.tensor_data(t)
     }
 
-    /// The underlying GGUF (e.g. to build a [`crate::tokenizer::Tokenizer`] from the same mmap).
-    pub fn gguf(&self) -> &GgufFile {
-        &self.gguf
+    /// The model's tokenizer.
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
     }
 
     // --- forward pass (single-token, cached) ---
