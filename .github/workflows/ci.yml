@@ -53,3 +53,8 @@ jobs:
       # future e2e tests are picked up automatically once marked `#[ignore]`.
       - name: Run end-to-end model tests
         run: cargo test --release -- --ignored
+
+      # Benchmark + correctness smoke test via the CLI binary: greedily generates 64 tokens
+      # and asserts the reply mentions Paris (robust across builds/arches; no exact-id gate).
+      - name: Generation benchmark
+        run: ./benchmark.sh
