@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,5 +30,26 @@ jobs:
       - name: Build (release)
         run: cargo build --release --verbose
 
-      - name: Test
+      - name: Fast unit tests
         run: cargo test --verbose
+
+      # The ~5.2 GB Q4_K_M GGUF is downloaded from Hugging Face (public, no auth) and cached
+      # across runs under a key tied to its filename, so it survives code changes and only
+      # re-downloads on a cache miss/eviction.
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: LFM2.5-8B-A1B-Q4_K_M.gguf
+          key: gguf-LFM2.5-8B-A1B-Q4_K_M
+
+      - name: Download model weights if not cached
+        run: |
+          test -f LFM2.5-8B-A1B-Q4_K_M.gguf || \
+          curl -fL -o LFM2.5-8B-A1B-Q4_K_M.gguf \
+            "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf"
+
+      # End-to-end tests are `#[ignore]`d so the plain `cargo test` above stays model-free;
+      # `--ignored` (no `--test` filter) runs every ignored test across all binaries, so
+      # future e2e tests are picked up automatically once marked `#[ignore]`.
+      - name: Run end-to-end model tests
+        run: cargo test --release -- --ignored
