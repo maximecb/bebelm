@@ -104,7 +104,7 @@ fn multi_turn_remembers_context() {
     agent.append_user("My name is Quentin. Please remember it.");
     agent.assistant_turn(|_id, _piece| {});
 
-    agent.append_user("What is my name? Answer with just the name.");
+    agent.append_user("What is my name? Answer with just the name I just stated and no other output.");
     let turn = agent.assistant_turn(|_id, _piece| {});
 
     assert!(
