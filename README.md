@@ -1,5 +1,4 @@
-BebeLM
-------
+# BebeLM
 
 Pure-Rust, CPU-only implementation of [LFM2.5-8B-A1B Q4_K_M](https://www.liquid.ai/blog/lfm2-5-8b-a1b).
 This model is very capable and has only 1B active parameters, making it possible for the
@@ -13,7 +12,7 @@ interface that you can use.
 BebeLM was tested on an M5 CPU as well as Ryzen 7x and Threadripper CPUs. It should work
 on Intel and on Raspberry Pi 4/5 as well, but this is untested.
 
-### Setup instructions
+## Setup instructions
 
 Install cargo or update your rust toolchain:
 ```sh
@@ -24,21 +23,42 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update
 ```
 
-Running requires the ~5.2 GB Q4_K_M GGUF. Download it into the repo root:
+Running also requires the ~5.2 GB Q4_K_M GGUF. Download it:
 
 ```sh
 curl -L -o LFM2.5-8B-A1B-Q4_K_M.gguf \
   "https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf"
 ```
 
-The CLI reads the weights path from the `BEBELM_WEIGHTS_FILE` environment variable. This defaults
-to `./LFM2.5-8B-A1B-Q4_K_M.gguf` (repo root). You can optionally point it elsewhere with:
+The CLI reads the weights path from `BEBELM_WEIGHTS_FILE`, defaulting to
+`./LFM2.5-8B-A1B-Q4_K_M.gguf` (the current directory). Point it elsewhere with:
 
 ```sh
 export BEBELM_WEIGHTS_FILE=/path/to/LFM2.5-8B-A1B-Q4_K_M.gguf
 ```
 
-### Command-line interface
+### Installing via cargo
+
+Install the CLI from crates.io — this puts a `bebelm` binary on your `PATH`:
+
+```sh
+cargo install bebelm
+```
+
+On x86, use `RUSTFLAGS="-C target-cpu=native" cargo install bebelm` for AVX2 + FMA (see
+**CPU / SIMD build**); Apple Silicon needs no flags.
+
+### Development setup
+
+Clone the repo and build from source:
+
+```sh
+git clone https://github.com/maximecb/bebelm
+cd bebelm
+cargo build --release
+```
+
+## Command-line interface
 
 Build with `cargo build --release`, then run a subcommand on `./target/release/bebelm` (the
 examples below use `cargo run --release --` for convenience). Every subcommand loads the
@@ -67,7 +87,7 @@ cargo run --release -- chat
 cargo run --release -- generate --max-gen 64 "The capital of France is"
 ```
 
-### Public crate API
+## Public crate API
 
 `bebelm` is a library first; the CLI is a thin wrapper over it. The high-level entry point is
 `bebelm::agent::Agent` — a conversation bound to a loaded model that owns the token transcript
@@ -184,7 +204,7 @@ For lower-level use, `Model::forward_step(token, &mut Cache)` runs the cached fo
 directly, and `bebelm::tokenizer::Tokenizer` (`encode` / `decode`) and `bebelm::sampler::Sampler`
 are public if you want to drive decoding yourself.
 
-### CPU / SIMD build
+## CPU / SIMD build
 
 The x86 SIMD kernels are tuned for the machine you build on: `.cargo/config.toml` sets
 `target-cpu=native`, so a build automatically uses **AVX2 + FMA** when the CPU has them
@@ -207,7 +227,7 @@ RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
 The instruction set is chosen at build time; there is no single binary that switches at
 runtime.
 
-### Running the tests
+## Running the tests
 
 The test suite has two layers:
 
