@@ -5,18 +5,31 @@
 # Greedily generates a fixed number of tokens from a fixed chat prompt, prints the prefill /
 # decode throughput (tokens/sec), and checks the continuation against an expected string.
 #
-# Usage: ./benchmark.sh [path/to/model.gguf]
+# Usage: ./benchmark.sh [path/to/model.gguf] [num-threads]
+#
+# num-threads caps the rayon worker pool (passed through as `--num-threads`); omit it to use
+# all available cores. Set it to benchmark thread scaling, e.g. `./benchmark.sh model.gguf 4`.
 #
 # Determinism: greedy decoding (temperature 0) is bit-identical run-to-run on the same
 # binary/machine (pure f32, no RNG). Parallelizing matvec over output rows preserves this
-# (each row's accumulation order is unchanged); a later move to SIMD / FMA contraction
-# could shift the exact tokens — if the matmul math changes, update EXPECTED below.
+# (each row's accumulation order is unchanged, regardless of worker count, so num-threads does
+# not move the tokens); a later move to SIMD / FMA contraction could shift the exact tokens —
+# if the matmul math changes, update EXPECTED below.
 
 set -euo pipefail
 
 MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
 export BEBELM_WEIGHTS_FILE="$MODEL"
 MAX_NEW=64
+
+# Optional rayon worker count (positional arg 2). Empty means "let bebelm use all cores".
+# Built as an array so the flag is omitted entirely when unset; the `[@]+` guard keeps the
+# empty-array expansion safe under `set -u` on older bash (e.g. macOS's 3.2).
+NUM_THREADS="${2:-}"
+THREAD_OPT=()
+if [ -n "$NUM_THREADS" ]; then
+    THREAD_OPT=(--num-threads "$NUM_THREADS")
+fi
 
 # A single user turn in the model's ChatML chat format. `generate` prepends BOS
 # (<|startoftext|>) and stops at <|im_end|>, so we open at <|im_start|>user and end with the
@@ -40,13 +53,13 @@ fi
 echo "building (release)..."
 cargo build --release --quiet
 
-echo "running: chat completion ($MAX_NEW tokens) of: \"$USER_MSG\""
+echo "running: chat completion ($MAX_NEW tokens${NUM_THREADS:+, $NUM_THREADS threads}) of: \"$USER_MSG\""
 echo
 # `tee` to a temp file so the generation streams to the terminal live (the per-token
 # flushes in `generate` make it appear token-by-token) while we still capture it to parse.
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-./target/release/bebelm generate --greedy --max-gen "$MAX_NEW" "$PROMPT" | tee "$TMP"
+./target/release/bebelm generate --greedy --max-gen "$MAX_NEW" ${THREAD_OPT[@]+"${THREAD_OPT[@]}"} "$PROMPT" | tee "$TMP"
 OUT="$(cat "$TMP")"
 echo
 

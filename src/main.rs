@@ -35,7 +35,7 @@ fn main() -> ExitCode {
             eprintln!("usage:");
             eprintln!("  bebelm generate [opts] <prompt>...   text completion of a prompt");
             eprintln!("  bebelm chat     [opts]               interactive chat (streams thinking + reply)");
-            eprintln!("\n  opts (both): --greedy  --max-gen N  --max-think N  --no-think");
+            eprintln!("\n  opts (both): --greedy  --max-gen N  --max-think N  --no-think  --num-threads N");
             eprintln!("\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})");
             return ExitCode::FAILURE;
         }
@@ -90,7 +90,7 @@ fn cmd_generate(path: &str, args: &[String]) -> Cmd {
     Ok(())
 }
 
-/// Generation options shared by `generate` and `chat`, parsed from command-line flags.
+/// Options shared by `generate` and `chat`, parsed from command-line flags.
 #[derive(Default)]
 struct AgentOptions {
     max_gen: Option<usize>,
@@ -117,6 +117,10 @@ impl AgentOptions {
 
 /// Parse the shared agent flags (`--greedy`, `--no-think`, `--max-gen N`, `--max-think N`),
 /// returning the options plus any leftover positional arguments (e.g. a prompt).
+///
+/// `--num-threads N` is handled here rather than via [`AgentOptions`]: it sizes rayon's global
+/// pool (a process-wide, one-shot setting), so it's applied as a side effect on sight — before
+/// any model load or parallel work — rather than threaded through the per-agent options.
 fn parse_agent_options(args: &[String]) -> Result<(AgentOptions, Vec<String>), Box<dyn Error>> {
     let mut opts = AgentOptions::default();
     let mut positional = Vec::new();
@@ -132,6 +136,17 @@ fn parse_agent_options(args: &[String]) -> Result<(AgentOptions, Vec<String>), B
             "--max-think" => {
                 let v = it.next().ok_or("--max-think needs a value")?;
                 opts.max_think = Some(v.parse().map_err(|_| format!("invalid --max-think {v:?}"))?);
+            }
+            "--num-threads" => {
+                let v = it.next().ok_or("--num-threads needs a value")?;
+                let n: usize = v.parse().map_err(|_| format!("invalid --num-threads {v:?}"))?;
+                if n == 0 {
+                    return Err("--num-threads must be >= 1".into());
+                }
+                // Size rayon's global pool right here: it's a one-shot, process-wide setting, so
+                // applying it on sight keeps the change local and guarantees it lands before any
+                // parallel work. Omitting the flag leaves rayon's default (one worker per core).
+                rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
             }
             s if s.starts_with("--") => return Err(format!("unknown option {s:?}").into()),
             _ => positional.push(arg.clone()),

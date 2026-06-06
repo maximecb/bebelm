@@ -54,6 +54,7 @@ Both commands take the same options (sampling defaults to the model's recommende
 - `--max-gen N` — cap tokens generated per turn (default 2048).
 - `--max-think N` — cap the `<think>` reasoning block to N tokens (forces `</think>`).
 - `--no-think` — disable reasoning (equivalent to `--max-think 0`).
+- `--num-threads N` — cap the rayon worker pool (default: one per available core).
 
 ```sh
 # Interactive chat
