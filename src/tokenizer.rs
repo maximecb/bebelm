@@ -120,7 +120,7 @@ impl Tokenizer {
                 .collect(),
             None => Vec::new(),
         };
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
 
         let byte_encoder = byte_to_unicode();
         let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
