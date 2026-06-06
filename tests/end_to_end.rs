@@ -73,6 +73,46 @@ fn csv_to_markdown_table() {
     assert!(pipes >= 12, "expected a Markdown table (>=12 '|'), found {pipes} in:\n{out}");
 }
 
+/// A ChatML instruction turn that asks the model to convert a small Markdown table into an HTML
+/// table. Companion to `csv_to_markdown_table`: it exercises the same instruction-following over
+/// inlined structured input, but the target format is markup rather than more Markdown. We assert
+/// robust signals: every source cell is reproduced, and the reply contains the structural HTML
+/// table tags rather than prose or a passed-through Markdown table.
+#[test]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+fn markdown_table_to_html() {
+    let model = load_model();
+
+    // A minimal 2-column Markdown table: a header row, the separator, and two data rows.
+    let markdown = "\
+| Name | Role |
+| ---- | ---- |
+| Alice | Engineer |
+| Bob | Designer |";
+
+    // `--no-think` (max_think 0): answer directly instead of opening a reasoning block, so the
+    // table is the whole reply and a modest token budget suffices.
+    let mut agent = Agent::new(&model).expect("build agent").greedy().max_think(0).max_gen(200);
+    agent.append_user(&format!(
+        "Convert the following Markdown table into an HTML table. Output only the HTML.\n\n{markdown}"
+    ));
+    let turn = agent.assistant_turn(|_id, _piece| {});
+    let out = &turn.text;
+
+    // Every cell from the source table should survive the conversion.
+    for cell in ["Name", "Role", "Alice", "Engineer", "Bob", "Designer"] {
+        assert!(out.contains(cell), "HTML table is missing {cell:?}, got:\n{out}");
+    }
+    // Structural tags that prove the output is an actual HTML table and not prose or a
+    // passed-through Markdown table. `<td` or `<th` (cell open) must appear for the data cells.
+    assert!(out.contains("<table"), "expected a <table> element, got:\n{out}");
+    assert!(out.contains("<tr"), "expected table rows (<tr>), got:\n{out}");
+    assert!(
+        out.contains("<td") || out.contains("<th"),
+        "expected table cells (<td>/<th>), got:\n{out}"
+    );
+}
+
 /// Greedy decoding (temperature 0, argmax) must be reproducible: the same prompt run twice
 /// against the same weights yields identical token ids. A build-/architecture-portable
 /// determinism guard over the whole numeric pipeline, with no hardcoded ids.
