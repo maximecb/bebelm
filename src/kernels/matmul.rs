@@ -128,8 +128,9 @@ fn dot_q4k_block(block: &[u8], x: &[f32]) -> f32 {
 // the f32 FMA with a fused int8 dot-product. Activations stay f32 everywhere else.
 
 /// One activation vector quantized to Q8: int8 quants, one f32 `scale` per 256-block, and the
-/// sum of quants per 32-wide sub-block (for Q4_K's `min` term, which needs `Σ q_x`).
-struct Q8Vec {
+/// sum of quants per 32-wide sub-block (for Q4_K's `min` term, which needs `Σ q_x`). Built by
+/// [`quantize_q8`] and consumed via [`FusedJob::qx`]; its internals are an implementation detail.
+pub struct Q8Vec {
     q: Vec<i8>,
     scales: Vec<f32>,
     sums: Vec<i32>,
@@ -137,7 +138,7 @@ struct Q8Vec {
 
 /// Quantize activations to Q8: per 256-block `scale = max|x|/127`, `q = round(x/scale)` clamped
 /// to ±127. `x.len()` must be a multiple of 256 (true for K-quant `n_in`).
-fn quantize_q8(x: &[f32]) -> Q8Vec {
+pub fn quantize_q8(x: &[f32]) -> Q8Vec {
     let nblocks = x.len() / 256;
     let mut q = vec![0i8; x.len()];
     let mut scales = vec![0.0f32; nblocks];
@@ -369,14 +370,20 @@ pub struct FusedJob<'a> {
     pub n_in: usize,
     pub n_out: usize,
     pub x: &'a [f32],
+    /// `x` pre-quantized via [`quantize_q8`] (so several jobs sharing one `x` quantize it once).
+    /// When `Some` — only valid for Q4_K — rows take the Q8-activation integer dot; `None` rows
+    /// take the f32 fused dot over `x`. Must be the quantization of *this* job's `x`.
+    pub qx: Option<&'a Q8Vec>,
 }
 
 /// Run several fused matvecs as a **single** parallel region over all their output rows
 /// combined, writing job `j`'s `n_out` results into `out` at the running offset (so `out`
 /// must be `Σ n_out` long, jobs in order). Pooling the rows lets a few small matrices — e.g.
 /// the handful of selected MoE experts — saturate every core under one fork/join, instead of
-/// underutilizing it (and paying a join) one small matvec at a time. Each row is computed
-/// exactly as in [`matvec`], so results are identical to running the jobs separately.
+/// underutilizing it (and paying a join) one small matvec at a time. Each row uses the same
+/// per-row kernel a standalone call would: Q4_K jobs carrying a pre-quantized [`qx`](FusedJob::qx)
+/// take the Q8-activation integer dot, all others the f32 fused dot — so the batch is identical
+/// to running the jobs separately.
 pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
     // Per job: its row stride in bytes, and the first `out` row it owns (a prefix sum of
     // n_out). `starts` is ascending, so a row's owning job is a binary search away.
@@ -386,6 +393,7 @@ pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
     for j in jobs {
         let (blk_elems, blk_bytes) = j.dtype.block().expect("fused dtype has a block size");
         assert_eq!(j.x.len(), j.n_in, "matvec_fused_batch: x length must equal n_in");
+        assert!(j.qx.is_none() || j.dtype == GgmlType::Q4_K, "matvec_fused_batch: qx only valid for Q4_K");
         assert_eq!(j.n_in % blk_elems as usize, 0, "matvec_fused_batch: n_in not a block multiple");
         starts.push(total);
         row_bytes.push((j.n_in / blk_elems as usize) * blk_bytes as usize);
@@ -398,7 +406,11 @@ pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
         let j = starts.partition_point(|&s| s <= gr) - 1;
         let local = gr - starts[j];
         let job = &jobs[j];
-        *o = fused_row_dot(job.dtype, &job.w[local * row_bytes[j]..(local + 1) * row_bytes[j]], job.x);
+        let rb = &job.w[local * row_bytes[j]..(local + 1) * row_bytes[j]];
+        *o = match job.qx {
+            Some(q8) => dot_q4k_row_q8(rb, q8),
+            None => fused_row_dot(job.dtype, rb, job.x),
+        };
     };
     if total < PAR_MIN_ROWS {
         out.iter_mut().enumerate().for_each(|(gr, o)| row(gr, o));
@@ -608,31 +620,47 @@ mod tests {
     #[test]
     fn matvec_fused_batch_matches_separate_jobs() {
         // A batch must write each job's rows at its running offset, identical to running the
-        // jobs one at a time via fused_row_dot (bit-for-bit — same per-row code). Two dtypes
-        // span differing row strides (144 vs 210 B), so the partition_point row attribution
-        // is exercised across them; two sizes hit both the serial and parallel branches.
+        // jobs one at a time with the same per-row kernel (bit-for-bit). The Q4_K job carries a
+        // pre-quantized `qx`, so it must match the Q8 dot; the Q6_K job must match the f32 fused
+        // dot. Two dtypes span differing row strides (144 vs 210 B), exercising the
+        // partition_point row attribution; two sizes hit both the serial and parallel branches.
         let x1: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
         let x2: Vec<f32> = (0..256).map(|i| ((i % 5) as f32 - 2.0) * 0.07).collect();
+        let q8 = quantize_q8(&x1);
 
         // (3,5): total 8 < PAR_MIN_ROWS -> serial. (40,50): total 90 -> parallel.
         for &(n_a, n_b) in &[(3usize, 5usize), (40usize, 50usize)] {
             let wa = q4k_matrix(n_a, 1);
             let wb = q6k_matrix(n_b, 99);
             let jobs = vec![
-                FusedJob { dtype: GgmlType::Q4_K, w: &wa, n_in: 256, n_out: n_a, x: &x1 },
-                FusedJob { dtype: GgmlType::Q6_K, w: &wb, n_in: 256, n_out: n_b, x: &x2 },
+                FusedJob { dtype: GgmlType::Q4_K, w: &wa, n_in: 256, n_out: n_a, x: &x1, qx: Some(&q8) },
+                FusedJob { dtype: GgmlType::Q6_K, w: &wb, n_in: 256, n_out: n_b, x: &x2, qx: None },
             ];
             let mut out = vec![0.0f32; n_a + n_b];
             matvec_fused_batch(&jobs, &mut out);
 
             for o in 0..n_a {
                 let row = &wa[o * 144..(o + 1) * 144];
-                assert_eq!(out[o], fused_row_dot(GgmlType::Q4_K, row, &x1), "job A row {o}");
+                assert_eq!(out[o], dot_q4k_row_q8(row, &q8), "job A row {o}");
             }
             for o in 0..n_b {
                 let row = &wb[o * 210..(o + 1) * 210];
                 assert_eq!(out[n_a + o], fused_row_dot(GgmlType::Q6_K, row, &x2), "job B row {o}");
             }
+        }
+    }
+
+    #[test]
+    fn matvec_fused_batch_q4k_without_qx_falls_back_to_f32() {
+        // A Q4_K job with no pre-quantized activations takes the f32 fused dot (the `None` arm),
+        // identical to a standalone fused_row_dot.
+        let x: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let w = q4k_matrix(4, 7);
+        let jobs = vec![FusedJob { dtype: GgmlType::Q4_K, w: &w, n_in: 256, n_out: 4, x: &x, qx: None }];
+        let mut out = vec![0.0f32; 4];
+        matvec_fused_batch(&jobs, &mut out);
+        for o in 0..4 {
+            assert_eq!(out[o], fused_row_dot(GgmlType::Q4_K, &w[o * 144..(o + 1) * 144], &x), "row {o}");
         }
     }
 }

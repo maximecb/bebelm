@@ -20,7 +20,7 @@ set -euo pipefail
 
 MODEL="${1:-LFM2.5-8B-A1B-Q4_K_M.gguf}"
 export BEBELM_WEIGHTS_FILE="$MODEL"
-MAX_NEW=64
+MAX_NEW=128
 
 # Optional rayon worker count (positional arg 2). Empty means "let bebelm use all cores".
 # Built as an array so the flag is omitted entirely when unset; the `[@]+` guard keeps the
