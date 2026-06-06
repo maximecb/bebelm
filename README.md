@@ -1,7 +1,7 @@
 BebeLM
 ------
 
-Pure-Rust, CPU-only implementation of [LFM2.5-8B-A1B](https://www.liquid.ai/blog/lfm2-5-8b-a1b) Q4_K_M.
+Pure-Rust, CPU-only implementation of [LFM2.5-8B-A1B Q4_K_M](https://www.liquid.ai/blog/lfm2-5-8b-a1b).
 This model is very capable and has only 1B active parameters, making it possible for the
 model to run at interactive speeds without a GPU.
 
