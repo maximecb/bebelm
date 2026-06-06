@@ -1,8 +1,13 @@
 [package]
 name = "bebelm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M)"
+license = "MIT"
+repository = "https://github.com/maximecb/bebelm"
+homepage = "https://github.com/maximecb/bebelm"
+keywords = ["llm", "inference", "lfm2", "gguf", "cpu"]
+categories = ["command-line-utilities", "science"]
 
 [dependencies]
 # mmap the (~5 GB) GGUF read-only: lazy paging, shared page cache, no upfront read+alloc.
