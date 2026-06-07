@@ -199,9 +199,9 @@ fn tool_call_add_round_trip() {
         "Add two integers and return their sum.",
         Schema::new().req("a", Type::Int, "First addend").req("b", Type::Int, "Second addend"),
         |c| {
-            // Args arrive as raw text; parse what the tool needs.
-            let a: i64 = c.arg("a").and_then(|s| s.parse().ok()).unwrap_or(0);
-            let b: i64 = c.arg("b").and_then(|s| s.parse().ok()).unwrap_or(0);
+            // Args arrive as raw text; `parse_arg` parses one into the receiver's type.
+            let a: i64 = c.parse_arg("a").unwrap_or(0);
+            let b: i64 = c.parse_arg("b").unwrap_or(0);
             (a + b).to_string()
         },
     ));

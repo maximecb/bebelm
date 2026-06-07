@@ -224,9 +224,10 @@ let mut agent = Agent::new(&model).add_tool(Tool::new(
         .req("a", Type::Int, "First addend")
         .req("b", Type::Int, "Second addend"),
     |call| {
-        // Args arrive as raw text; the callback parses what it needs.
-        let a: i64 = call.arg("a").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let b: i64 = call.arg("b").and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Args arrive as raw text; `parse_arg` parses one into the receiver's type (`arg`
+        // gives the raw &str). Both return `Option`, so the callback picks the fallback here.
+        let a: i64 = call.parse_arg("a").unwrap_or(0);
+        let b: i64 = call.parse_arg("b").unwrap_or(0);
         (a + b).to_string()
     },
 ));

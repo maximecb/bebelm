@@ -167,6 +167,15 @@ impl ToolCall {
     pub fn arg(&self, name: &str) -> Option<&str> {
         self.args.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
+
+    /// Argument `name` parsed into type `T` (`i64`, `usize`, `f32`, `bool`, …) via
+    /// [`FromStr`](std::str::FromStr), inferred from the receiver at the call site. Returns `None`
+    /// if the argument is absent or its value doesn't parse as `T` — the model controls these
+    /// values, so a bad one is its mistake, not a reason to panic. Pick the fallback at the call
+    /// site: `.unwrap_or(default)`, or return an error string so the model can correct itself.
+    pub fn parse_arg<T: std::str::FromStr>(&self, name: &str) -> Option<T> {
+        self.arg(name)?.parse().ok()
+    }
 }
 
 /// Parse the content between `<|tool_call_start|>` and `<|tool_call_end|>` into calls. Accepts a
@@ -421,6 +430,18 @@ mod tests {
         assert_eq!(calls[1].arg("a"), Some("21"));
         assert_eq!(calls[1].arg("b"), Some("21"));
         assert_eq!(calls[0].arg("missing"), None);
+    }
+
+    #[test]
+    fn parse_arg_parses_into_receiver_type() {
+        let calls = parse_tool_calls("[add(a=21, b='oops', big=4000000000, r=2.5)]");
+        assert_eq!(calls[0].parse_arg::<i64>("a"), Some(21));
+        assert_eq!(calls[0].parse_arg::<u8>("a"), Some(21)); // narrows to the receiver's type
+        assert_eq!(calls[0].parse_arg::<f32>("r"), Some(2.5)); // not just integers
+        assert_eq!(calls[0].parse_arg::<u32>("b"), None); // present but doesn't parse
+        assert_eq!(calls[0].parse_arg::<i64>("missing"), None); // absent
+        assert_eq!(calls[0].parse_arg::<u8>("big"), None); // out of range for u8
+        assert_eq!(calls[0].parse_arg::<u64>("big"), Some(4_000_000_000));
     }
 
     #[test]
