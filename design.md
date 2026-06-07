@@ -369,6 +369,9 @@ src/
   cache.rs           # ✓ KV cache (attn) + conv-state cache (conv)
   sampler.rs         # ✓ temperature + top-k (+ rep penalty); temp 0 = greedy; hand-rolled PRNG
   tokenizer.rs       # ✓ byte-level BPE from GGUF (hand-rolled lfm2 pretokenizer, no regex)
+  agent.rs           # ✓ conversation session: transcript + caches, generation, tool loop
+  tool.rs            # ✓ function calling: Tool/Schema/ToolCall + Pythonic call parser (no serde)
+  chat.rs            # ✓ interactive chat REPL (bin module under main.rs)
   kernels/
     mod.rs           # ✓
     dequant.rs ✓  matmul.rs ✓  rmsnorm.rs ✓  rope.rs ✓
@@ -528,6 +531,10 @@ thumb for kernel code:
 
 ## Tool use
 
+> ✅ **Implemented** (`src/tool.rs` + `Agent` driver in `src/agent.rs`): tool declarations,
+> the Pythonic call parser, and the agentic call/result loop, validated end-to-end against the
+> real weights (`tests/end_to_end.rs::tool_call_add_round_trip`).
+
 LFM2.5 supports function calling. The model is *told* about tools in the system prompt,
 emits calls as a Pythonic list wrapped in special tokens, and reads results back from a
 `tool`-role message. Ground truth for the wire format is the `tokenizer.chat_template`
@@ -576,9 +583,9 @@ LFM2* convention; **LFM2.5 does not use them** — it uses the plaintext `List o
 preamble plus only the `<|tool_call_start/end|>` pair. So we ignore the `tool_list` tokens
 even though they exist in the vocab.
 
-### Proposed Rust interface
+### Rust interface
 
-Two constraints shape this: add **no new dependency** (so tool schemas and parsed call
+Two constraints shaped this: add **no new dependency** (so tool schemas and parsed call
 args are strings, not `serde_json::Value`), and keep `Agent: Clone` (so the tool set is
 shared behind `Arc`).
 
@@ -658,6 +665,14 @@ Driver loop:
 3. Otherwise close the assistant turn, `parse_tool_calls`, invoke each `Tool::call`, append
    `<|im_start|>tool\n{joined results}<|im_end|>\n`, and loop (bounded by `max_rounds`).
 
+`max_rounds` caps the number of assistant turns; the final one is reserved to *use* the last
+results, so at most `max_rounds - 1` rounds of tools run. An unknown tool name dispatches to an
+`"Error: no tool named …"` string fed back to the model rather than aborting. The returned
+`Turn` aggregates every round: `ids`/`text` concatenate, `stats` sum, and `stop` is the last
+round's reason (`Eos` for a normal answer, the new `StopReason::ToolCall` if the budget ran out
+mid-loop). When tools are registered, `generate` also stops at `<|tool_call_end|>` (kept in the
+transcript) so the driver acts without decoding the rest of the turn.
+
 ### Example
 
 ```rust
@@ -710,11 +725,14 @@ Behind the scenes this lays down one system block carrying both tool schemas
 calls `get_weather(city='Paris')` and `add(a=21, b=21)` — alternating `tool`-role results
 and reopened assistant turns, until the model produces a plain-text final answer.
 
-### Open design decisions
+### Design decisions (resolved)
 
-- **String args, no serde** (default, matches the dependency ethos) vs. pulling in
-  `serde_json` for typed `Value` args/schemas (more ergonomic, first convenience dep).
-- **Automated loop on `Agent`** (it runs the tools) vs. returning control to the caller on
-  each tool call so the *application* dispatches (more flexible, more boilerplate).
-- **System/tools appended first** (explicit ordering, fits the append-only transcript) vs.
-  lazy auto-injection (awkward once BOS / the first turn is laid down).
+- **String args, no serde** — chosen, matching the dependency ethos: tool schemas are built by
+  a hand-rolled JSON emitter and parsed call args are raw strings (the callback parses what it
+  needs). `serde_json` was *not* pulled in.
+- **Automated loop on `Agent`** — chosen: `assistant_turn_with_tools` runs the tools itself and
+  reports each call via the `on_tool` observer, rather than returning control to the caller per
+  call. Callers wanting manual dispatch can still drive `generate` + `parse_tool_calls` directly.
+- **System/tools appended first** — chosen: `append_system` emits the system block (with the
+  `List of tools:` preamble) explicitly, called before any user turn, fitting the append-only
+  transcript. Tools must be registered via `add_tool` before `append_system`.

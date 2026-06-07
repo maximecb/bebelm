@@ -15,6 +15,7 @@
 
 use bebelm::agent::Agent;
 use bebelm::model::Model;
+use bebelm::tool::{Schema, Tool, Type};
 
 /// Default weights path when `$BEBELM_WEIGHTS_FILE` is unset (relative to the cwd).
 const DEFAULT_WEIGHTS_FILE: &str = "./LFM2.5-8B-A1B-Q4_K_M.gguf";
@@ -180,5 +181,50 @@ fn clone_forks_independent_continuations() {
         base.history().len(),
         base_len_before,
         "cloning should fork the transcript — generating on the clone must not mutate the original"
+    );
+}
+
+/// Function calling, end to end: register an `add` tool, ask a question that needs it, and run
+/// the agentic loop. This exercises the whole tool path — schema emission into the system block,
+/// the model emitting a call between `<|tool_call_start|>`/`<|tool_call_end|>`, parsing and
+/// dispatching it, feeding the result back as a `tool`-role message, and the model using it in a
+/// final answer. We assert robust signals: the tool was invoked returning 42, and the final
+/// reply states 42.
+#[test]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+fn tool_call_add_round_trip() {
+    let model = load_model();
+    let mut agent = Agent::new(&model).greedy().max_think(200).max_gen(256).add_tool(Tool::new(
+        "add",
+        "Add two integers and return their sum.",
+        Schema::new().req("a", Type::Int, "First addend").req("b", Type::Int, "Second addend"),
+        |c| {
+            // Args arrive as raw text; parse what the tool needs.
+            let a: i64 = c.arg("a").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let b: i64 = c.arg("b").and_then(|s| s.parse().ok()).unwrap_or(0);
+            (a + b).to_string()
+        },
+    ));
+    agent.append_system("You are a helpful assistant. Use the provided tools when they apply.");
+    agent.append_user("What is 21 + 21? Use the add tool, then state the result.");
+
+    // Record each dispatched call so we can assert the tool actually ran (not just that the
+    // final text happens to contain 42).
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let turn = agent.assistant_turn_with_tools(
+        4,
+        |_id, _text| {},
+        |call, result| calls.push((call.name.clone(), result.to_string())),
+    );
+
+    assert!(
+        calls.iter().any(|(name, result)| name == "add" && result == "42"),
+        "expected the model to call add(...) returning 42; calls: {calls:?}\nreply:\n{}",
+        turn.text
+    );
+    assert!(
+        turn.text.contains("42"),
+        "expected the final answer to state 42, got:\n{}",
+        turn.text
     );
 }

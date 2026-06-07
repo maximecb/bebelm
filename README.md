@@ -5,7 +5,7 @@ This model is very capable and has only 1B active parameters, making it possible
 model to run at interactive speeds without a GPU.
 
 This package intentionally has very few dependencies and requires no extra system
-packages to run, making it easy to build and run.
+packages to compile, making it easy to build and run.
 This is a library crate which can be imported into your Rust projects, and it's now available
 via [crates.io](https://crates.io/crates/bebelm). There is also a basic command-line
 interface that you can use.
@@ -156,7 +156,7 @@ pub struct Turn {
     pub ids: Vec<u32>,    // generated ids (excludes the prompt and the terminating EOS)
     pub text: String,     // the decoded reply
     pub stats: GenStats,  // prompt_tokens, generated_tokens, prefill/decode Durations + *_tps()
-    pub stop: StopReason, // Eos or MaxNew
+    pub stop: StopReason, // Eos, MaxNew, or ToolCall
 }
 ```
 
@@ -202,6 +202,50 @@ b.append_user("What is the capital of Italy?");
 println!("{}", a.assistant_turn(|_, _| {}).text);
 println!("{}", b.assistant_turn(|_, _| {}).text);
 ```
+
+**Tool use (function calling)** — register tools with `add_tool`, advertise them in the system
+block with `append_system`, then let `assistant_turn_with_tools` run the loop: it generates,
+dispatches each tool the model calls, feeds the results back as a `tool`-role message, and
+repeats until the model produces a plain-text answer (bounded by `max_rounds` assistant turns).
+Tool schemas and parsed arguments are plain strings — no `serde` dependency.
+
+```rust
+use bebelm::agent::Agent;
+use bebelm::model::Model;
+use bebelm::tool::{Schema, Tool, Type};
+
+let model = Model::load("LFM2.5-8B-A1B-Q4_K_M.gguf")?;
+
+// Register tools before the system block. `Tool` is `Clone`, so `Agent` stays `Clone`.
+let mut agent = Agent::new(&model).add_tool(Tool::new(
+    "add",
+    "Add two integers.",
+    Schema::new()
+        .req("a", Type::Int, "First addend")
+        .req("b", Type::Int, "Second addend"),
+    |call| {
+        // Args arrive as raw text; the callback parses what it needs.
+        let a: i64 = call.arg("a").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let b: i64 = call.arg("b").and_then(|s| s.parse().ok()).unwrap_or(0);
+        (a + b).to_string()
+    },
+));
+
+agent.append_system("You are a helpful assistant.");
+agent.append_user("What is 21 + 21?");
+
+// Run the agentic loop: stream the reply, and observe each tool call + result.
+let turn = agent.assistant_turn_with_tools(
+    8,                                            // max assistant turns
+    |_id, text| print!("{text}"),
+    |call, result| eprintln!("[tool] {} -> {result}", call.name),
+);
+println!("\n{}", turn.text);
+```
+
+`Schema::req` / `Schema::opt` declare required / optional parameters (`Type` is `Str`, `Int`,
+`Num`, or `Bool`); `Tool::raw` is an escape hatch that takes the entire tool JSON verbatim. An
+unknown tool name is reported back to the model rather than aborting the loop.
 
 **Special tokens** live in `bebelm::tokenizer` as `u32` constants. The agent handles BOS, EOS,
 and the ChatML / `<think>` framing for you — these are mostly for interpreting the `id` your

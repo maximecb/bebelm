@@ -13,8 +13,9 @@ use crate::model::Model;
 use crate::sampler::Sampler;
 use crate::tokenizer::{
     TOKEN_BOS, TOKEN_ENDOFTEXT, TOKEN_IM_END, TOKEN_IM_START, TOKEN_PAD, TOKEN_THINK,
-    TOKEN_THINK_END,
+    TOKEN_THINK_END, TOKEN_TOOL_CALL_END, TOKEN_TOOL_CALL_START,
 };
+use crate::tool::{parse_tool_calls, Tool, ToolCall};
 
 /// Default per-turn generation cap. A reasoning (`<think>`) turn can run long, so this is
 /// generous; it only bounds a runaway turn.
@@ -41,6 +42,10 @@ pub enum StopReason {
     Eos,
     /// Hit the per-turn `max_gen` cap.
     MaxNew,
+    /// The model closed a tool call (`<|tool_call_end|>`); only reachable when tools are
+    /// registered. The driver in [`Agent::assistant_turn_with_tools`] acts on the call and
+    /// continues, so callers of [`Agent::generate`] normally won't see this.
+    ToolCall,
 }
 
 /// Timing + counts from a generation run.
@@ -91,6 +96,10 @@ pub struct Agent<'m> {
     /// Cap on `<think>…</think>` reasoning tokens before `</think>` is forced; `usize::MAX`
     /// leaves reasoning unbounded.
     max_think: usize,
+    /// Tools the model may call. Empty (the default) leaves generation tool-free; registering
+    /// any tool makes [`generate`](Self::generate) also stop at `<|tool_call_end|>` and enables
+    /// the [`assistant_turn_with_tools`](Self::assistant_turn_with_tools) driver.
+    tools: Vec<Tool>,
 }
 
 impl<'m> Agent<'m> {
@@ -105,6 +114,7 @@ impl<'m> Agent<'m> {
             max_gen: DEFAULT_MAX_GEN,
             max_context: DEFAULT_MAX_CONTEXT,
             max_think: usize::MAX,
+            tools: Vec::new(),
         }
     }
 
@@ -154,6 +164,14 @@ impl<'m> Agent<'m> {
         self
     }
 
+    /// Register a tool the model may call. Add all tools before [`append_system`](Self::append_system),
+    /// which advertises them in the system block. With tools registered, drive the conversation
+    /// with [`assistant_turn_with_tools`](Self::assistant_turn_with_tools).
+    pub fn add_tool(mut self, tool: Tool) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
     // --- Building the prompt (these only grow the transcript) ---
 
     /// Tokenize raw `text` and append it to the transcript. The BOS token is prepended only on
@@ -175,6 +193,26 @@ impl<'m> Agent<'m> {
         self.history.extend_from_slice(ids);
     }
 
+    /// Append the system block: `<|im_start|>system\n{text}` plus, if any tools are registered,
+    /// the `\nList of tools: [{…}, …]` preamble that advertises them — then `<|im_end|>\n`.
+    /// Call this first (the system block follows BOS, before any user turn) and after all
+    /// [`add_tool`](Self::add_tool) calls.
+    pub fn append_system(&mut self, text: &str) {
+        let mut block = format!("<|im_start|>system\n{text}");
+        if !self.tools.is_empty() {
+            block.push_str("\nList of tools: [");
+            for (i, tool) in self.tools.iter().enumerate() {
+                if i > 0 {
+                    block.push_str(", ");
+                }
+                block.push_str(tool.schema());
+            }
+            block.push(']');
+        }
+        block.push_str("<|im_end|>\n");
+        self.append(&block);
+    }
+
     // --- Generation ---
 
     /// Open an assistant turn, generate its reply, and close the turn so the transcript stays
@@ -183,11 +221,105 @@ impl<'m> Agent<'m> {
     pub fn assistant_turn(&mut self, on_token: impl FnMut(u32, &str)) -> Turn {
         self.append(ASSISTANT_OPEN);
         let turn = self.generate(on_token);
-        // The reply excludes the closing <|im_end|> (generate stops at it), so close the turn
-        // explicitly and add the trailing newline the template puts between turns.
+        self.close_assistant_turn();
+        turn
+    }
+
+    /// Close the current assistant turn in the transcript. The reply itself excludes the closing
+    /// `<|im_end|>` (generation stops at it, or at a tool call), so append it explicitly plus the
+    /// trailing newline the template puts between turns.
+    fn close_assistant_turn(&mut self) {
         self.history.push(TOKEN_IM_END);
         self.append("\n");
-        turn
+    }
+
+    /// Run the agentic tool loop. Each round opens an assistant turn and generates; when the reply
+    /// is a tool call, every call is dispatched to its registered [`Tool`], the joined results are
+    /// appended as a `tool`-role message, and the loop continues. It ends when the model replies
+    /// with no tool call — or after `max_rounds` assistant turns (so at most `max_rounds - 1`
+    /// rounds of tool results, the final turn being reserved to use them). `on_token` streams
+    /// every generated token (tool calls included); `on_tool` observes each dispatched call and
+    /// its result. Requires at least one registered [`add_tool`](Self::add_tool); with none, this
+    /// behaves like a single [`assistant_turn`](Self::assistant_turn).
+    ///
+    /// The returned [`Turn`] aggregates all rounds: `ids`/`text` concatenate everything generated,
+    /// `stats` sum across rounds, and `stop` is the final round's reason (`Eos` for a normal
+    /// answer, or `ToolCall` if the round budget was hit while still calling tools).
+    pub fn assistant_turn_with_tools(
+        &mut self,
+        max_rounds: usize,
+        mut on_token: impl FnMut(u32, &str),
+        mut on_tool: impl FnMut(&ToolCall, &str),
+    ) -> Turn {
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        let mut prompt_tokens = 0;
+        let mut generated_tokens = 0;
+        let mut prefill = Duration::ZERO;
+        let mut decode = Duration::ZERO;
+        let mut stop = StopReason::Eos;
+
+        for round in 0..max_rounds {
+            self.append(ASSISTANT_OPEN);
+            let turn = self.generate(&mut on_token);
+            ids.extend_from_slice(&turn.ids);
+            text.push_str(&turn.text);
+            prompt_tokens += turn.stats.prompt_tokens;
+            generated_tokens += turn.stats.generated_tokens;
+            prefill += turn.stats.prefill;
+            decode += turn.stats.decode;
+            stop = turn.stop;
+            self.close_assistant_turn();
+
+            // No tool call ⇒ this is the model's final, plain-text answer.
+            let calls = self.tool_calls_in(&turn.ids);
+            if calls.is_empty() {
+                break;
+            }
+            // The last allowed turn is reserved for the model to *use* the previous results; if it
+            // still wants tools here, stop rather than dispatch a round we can't feed back.
+            if round + 1 == max_rounds {
+                break;
+            }
+
+            // Dispatch each call and feed the joined results back as a single `tool`-role message.
+            let mut results = Vec::with_capacity(calls.len());
+            for call in &calls {
+                let result = self.dispatch(call);
+                on_tool(call, &result);
+                results.push(result);
+            }
+            self.append(&format!("<|im_start|>tool\n{}<|im_end|>\n", results.join("\n")));
+        }
+
+        Turn {
+            ids,
+            text,
+            stats: GenStats { prompt_tokens, generated_tokens, prefill, decode },
+            stop,
+        }
+    }
+
+    /// Parse the tool calls from one turn's generated `ids`: the span between `<|tool_call_start|>`
+    /// and `<|tool_call_end|>`, decoded to text and handed to [`parse_tool_calls`]. Empty if the
+    /// turn carried no (complete) tool call.
+    fn tool_calls_in(&self, ids: &[u32]) -> Vec<ToolCall> {
+        let Some(start) = ids.iter().position(|&t| t == TOKEN_TOOL_CALL_START) else {
+            return Vec::new();
+        };
+        let Some(len) = ids[start + 1..].iter().position(|&t| t == TOKEN_TOOL_CALL_END) else {
+            return Vec::new();
+        };
+        let inner = self.model.tokenizer().decode(&ids[start + 1..start + 1 + len]);
+        parse_tool_calls(&inner)
+    }
+
+    /// Run the registered tool matching `call.name`, or report the unknown name back to the model.
+    fn dispatch(&self, call: &ToolCall) -> String {
+        match self.tools.iter().find(|t| t.name() == call.name) {
+            Some(tool) => tool.invoke(call),
+            None => format!("Error: no tool named {:?}", call.name),
+        }
     }
 
     /// Prefill any appended-but-unprocessed tokens, then decode a continuation until the model
@@ -224,6 +356,9 @@ impl<'m> Agent<'m> {
         // Set for the one token right after a `</think>`: it may not be a turn-ender, so the model
         // can't close the turn with an empty answer (common right after a forced `</think>`).
         let mut require_answer = false;
+        // With tools registered, end the turn at `<|tool_call_end|>` so the driver can act on the
+        // call without decoding the rest of the turn (the closing token is kept in the transcript).
+        let tools_active = !self.tools.is_empty();
         let stop = loop {
             if think_capped {
                 logits[TOKEN_THINK as usize] = f32::NEG_INFINITY;
@@ -262,6 +397,9 @@ impl<'m> Agent<'m> {
             on_token(next, &text);
             ids.push(next);
             self.history.push(next);
+            if tools_active && next == TOKEN_TOOL_CALL_END {
+                break StopReason::ToolCall;
+            }
             if ids.len() >= self.max_gen {
                 break StopReason::MaxNew;
             }
