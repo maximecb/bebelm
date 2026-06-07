@@ -20,16 +20,23 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      # On x86_64 runners the aarch64 inline-asm matvec kernel is cfg'd out, so the portable
-      # `wide` SIMD fallback is what gets built and tested here. `.cargo/config.toml` pins
-      # target-cpu=native, which resolves to the runner's own CPU (binaries run on that same
-      # host, so the baked-in ISA is always valid).
+      # Check that the dev config builds
       - name: Build (dev)
         run: cargo build --verbose
 
+      # Build and test with x86-64-v2 config
+      - name: Build (release, x86-64-v2)
+        run: cargo build --release --verbose
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      - name: Fast unit tests (x86-64-v2)
+        run: cargo test --release --verbose
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+      # Check that the native config builds (likely x86-64-v3)
       - name: Build (release)
         run: cargo build --release --verbose
-
       - name: Fast unit tests
         run: cargo test --verbose
 
