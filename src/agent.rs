@@ -291,6 +291,7 @@ impl<'m> Agent<'m> {
     pub fn clear(&mut self) {
         self.history.clear();
         self.cache = Cache::new();
+        self.sampler.reset();
     }
 
     /// The full token transcript so far.

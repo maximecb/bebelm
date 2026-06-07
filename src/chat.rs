@@ -52,7 +52,7 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
     let mut agent = opts.apply(Agent::new(&model));
     let pal = Palette::detect();
 
-    eprintln!("Chat ready. Type a message. Input Ctrl-D or /exit to quit.\n");
+    eprintln!("Chat ready. Type a message. Input Ctrl-D or /exit to quit, /clear to reset history.\n");
 
     let stdin = io::stdin();
     let mut line = String::new();
@@ -71,6 +71,11 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
         }
         if input == "/exit" || input == "/quit" {
             break;
+        }
+        if input == "/clear" {
+            agent.clear();
+            eprintln!("{}Chat history cleared.{}", pal.dim, pal.reset);
+            continue;
         }
 
         // Expand any `@path` file references into inline fenced blocks before sending.
