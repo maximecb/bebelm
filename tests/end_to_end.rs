@@ -153,3 +153,32 @@ fn multi_turn_remembers_context() {
         turn.text
     );
 }
+
+/// Cloning forks a prefilled conversation: each clone continues independently from the shared
+/// prefix without re-running its prefill, and generating on one clone leaves the other's
+/// transcript untouched.
+#[test]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+fn clone_forks_independent_continuations() {
+    let model = load_model();
+    let mut base = Agent::new(&model).greedy().max_think(200).max_gen(64);
+
+    base.append_user("My name is Quentin. Please remember it.");
+    base.assistant_turn(|_id, _piece| {});
+    let base_len_before = base.history().len();
+
+    let mut fork = base.clone();
+    fork.append_user("What is my name? Answer with just the name I just stated and no other output.");
+    let turn = fork.assistant_turn(|_id, _piece| {});
+
+    assert!(
+        turn.text.contains("Quentin"),
+        "the fork should recall the name from the shared prefix, got:\n{}",
+        turn.text
+    );
+    assert_eq!(
+        base.history().len(),
+        base_len_before,
+        "cloning should fork the transcript — generating on the clone must not mutate the original"
+    );
+}

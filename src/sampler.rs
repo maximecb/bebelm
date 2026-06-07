@@ -9,6 +9,7 @@
 const DEFAULT_SEED: u64 = 0x853C_49E6_748F_EA9B;
 
 /// Sampling configuration + PRNG state.
+#[derive(Clone)]
 pub struct Sampler {
     /// `0.0` ⇒ greedy (deterministic argmax).
     pub temperature: f32,

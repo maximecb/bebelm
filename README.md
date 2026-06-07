@@ -185,6 +185,24 @@ agent.assistant_turn(|id, text| {
 `agent.clear()` resets the conversation (keeping the weights); `agent.history()` returns the
 full token transcript.
 
+**Cloning** — `Agent` implements `Clone`, so a prefilled prompt (e.g. a system prompt plus a
+few example turns) can be built and prefilled once, then cheaply forked into several
+independent continuations — each clone keeps its own transcript and KV/conv caches, and
+generating on one doesn't affect the others:
+
+```rust
+let mut base = Agent::new(&model).greedy();
+base.append_user("You are a terse assistant. Answer in one word where possible.");
+base.assistant_turn(|_, _| {});   // prefill the shared prefix once
+
+let mut a = base.clone();
+let mut b = base.clone();
+a.append_user("What is the capital of France?");
+b.append_user("What is the capital of Italy?");
+println!("{}", a.assistant_turn(|_, _| {}).text);
+println!("{}", b.assistant_turn(|_, _| {}).text);
+```
+
 **Special tokens** live in `bebelm::tokenizer` as `u32` constants. The agent handles BOS, EOS,
 and the ChatML / `<think>` framing for you — these are mostly for interpreting the `id` your
 `on_token` callback receives:

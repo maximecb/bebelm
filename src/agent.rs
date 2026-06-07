@@ -74,6 +74,11 @@ pub struct Turn {
 /// A live conversation bound to a borrowed [`Model`]. Owns the transcript, the decode-time
 /// caches, the sampler, and the per-turn limits; the heavy weights stay in the shared model,
 /// so one loaded model can back several independent agents.
+///
+/// `Agent` is [`Clone`]: cloning copies the transcript and caches, so a prefilled prompt (e.g.
+/// a system prompt plus a few example turns) can be built once and cheaply forked into several
+/// independent continuations without re-running the prefill for the shared prefix.
+#[derive(Clone)]
 pub struct Agent<'m> {
     model: &'m Model,
     cache: Cache,

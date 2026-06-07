@@ -6,6 +6,7 @@
 
 use crate::config::{CONV_L_CACHE, HIDDEN, KV_DIM, N_LAYERS};
 
+#[derive(Clone)]
 pub struct Cache {
     /// Per attention layer: appended key history (`KV_DIM` floats per position).
     pub k: Vec<Vec<f32>>,
