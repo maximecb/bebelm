@@ -523,3 +523,198 @@ thumb for kernel code:
   `softmax`, `attention_decode`, `conv_step`) and the `model.rs` orchestration un-annotated
   — they run only O(layers)/token, so call overhead is negligible and force-inlining would
   only bloat code with no hot-loop payoff.
+
+---
+
+## Tool use
+
+LFM2.5 supports function calling. The model is *told* about tools in the system prompt,
+emits calls as a Pythonic list wrapped in special tokens, and reads results back from a
+`tool`-role message. Ground truth for the wire format is the `tokenizer.chat_template`
+embedded in the GGUF (cross-checked against Liquid's
+[tool-use docs](https://docs.liquid.ai/lfm/key-concepts/tool-use)).
+
+### Wire format (verified against the embedded chat template)
+
+**1. Tool declarations** — appended to the *system* block, on a line after any system text.
+The template builds `system_prompt + "\nList of tools: [" + (tools | join(", ")) + "]"`:
+
+```
+<|im_start|>system
+{optional system text}
+List of tools: [{"name": "get_weather", "description": "...", "parameters": {"type":"object","properties":{...},"required":[...]}}, {...}]<|im_end|>
+```
+
+Each tool is a JSON object with `name`, `description`, and `parameters` (a JSON-Schema
+object).
+
+**2. Tool-call emission** — the assistant turn produces a *Python-style* call list between
+`<|tool_call_start|>` and `<|tool_call_end|>`, before the turn's closing `<|im_end|>`:
+
+```
+<|tool_call_start|>[get_weather(location='Paris', units='celsius')]<|tool_call_end|>
+```
+
+Multiple calls are allowed (comma-separated). String args are quoted; per the template,
+dict/list args are JSON-encoded and numbers/bools stringified. (Adding *"Output function
+calls as JSON"* to the system prompt switches the model to JSON-object calls, but Pythonic
+is the default and what the template renders.)
+
+**3. Tool-result feedback** — results go back as a `tool`-role message; then the assistant
+turn is reopened to let the model use them:
+
+```
+<|im_start|>tool
+{result text, typically JSON}<|im_end|>
+<|im_start|>assistant
+```
+
+**⚠️ Token caveat (LFM2 vs LFM2.5).** The vocab carries `<|tool_list_start|>` /
+`<|tool_list_end|>` (124903/4) *and* `<|tool_call_start|>` / `<|tool_call_end|>` (124905/6).
+Per Liquid's docs the `<|tool_list_*|>` (and `<|tool_response_*|>`) tokens are the *older
+LFM2* convention; **LFM2.5 does not use them** — it uses the plaintext `List of tools:`
+preamble plus only the `<|tool_call_start/end|>` pair. So we ignore the `tool_list` tokens
+even though they exist in the vocab.
+
+### Proposed Rust interface
+
+Two constraints shape this: add **no new dependency** (so tool schemas and parsed call
+args are strings, not `serde_json::Value`), and keep `Agent: Clone` (so the tool set is
+shared behind `Arc`).
+
+A `Tool` value carries the JSON declaration plus a callback; `ToolCall` is one parsed call:
+
+```rust
+// src/tool.rs
+#[derive(Clone)]
+pub struct Tool {
+    name: String,                          // must match the name inside `schema`
+    schema: String,                        // {"name":...,"description":...,"parameters":{...}}
+    call: Arc<dyn Fn(&ToolCall) -> String>, // Arc keeps Agent Clone; 'static (tools own state)
+}
+impl Tool {
+    // Structured params via the `Schema` builder; the full tool JSON is assembled for you
+    // (name/description JSON-escaped).
+    pub fn new(name: impl Into<String>, description: &str, params: Schema,
+               call: impl Fn(&ToolCall) -> String + 'static) -> Self { ... }
+    // Escape hatch: supply the entire tool JSON (incl. `parameters`) verbatim.
+    pub fn raw(name: impl Into<String>, schema: impl Into<String>,
+               call: impl Fn(&ToolCall) -> String + 'static) -> Self { ... }
+}
+
+/// JSON-Schema parameter type → emits `"type":"string"|"integer"|"number"|"boolean"`.
+pub enum Type { Str, Int, Num, Bool }   // extend later: Enum(&[&str]), Array(Box<Type>)
+
+/// Builder for a tool's `parameters` object; renders the standard JSON-Schema string
+/// `{"type":"object","properties":{…},"required":[…]}` via a small hand-rolled emitter
+/// (no serde). `type` is kept because it's part of the format the model was trained on.
+pub struct Schema { /* Vec<{ name, ty: Type, desc, required }> */ }
+impl Schema {
+    pub fn new() -> Self { ... }
+    pub fn req(self, name: &str, ty: Type, desc: &str) -> Self { ... } // required field
+    pub fn opt(self, name: &str, ty: Type, desc: &str) -> Self { ... } // optional field
+}
+
+pub struct ToolCall {
+    pub name: String,
+    args: Vec<(String, String)>,           // arg name -> raw value text (quotes stripped for
+    pub raw: String,                       //   simple literals; {..}/[..] passed verbatim)
+}
+impl ToolCall { pub fn arg(&self, name: &str) -> Option<&str> { ... } }
+
+// Parse the content between the tool-call tokens into calls. Hand-rolled (consistent with
+// the no-regex tokenizer): quoted strings, numbers, bools, brace/bracket-balanced values.
+pub(crate) fn parse_tool_calls(s: &str) -> Vec<ToolCall> { ... }
+```
+
+`Agent` gains a tool list, a system-block emitter, and an agentic driver:
+
+```rust
+pub struct Agent<'m> { /* ...existing... */ tools: Vec<Tool> } // Tool: Clone, so derive holds
+
+impl<'m> Agent<'m> {
+    pub fn add_tool(mut self, tool: Tool) -> Self { ... } // register (before the system block)
+
+    // Emit `<|im_start|>system\n{text}\nList of tools: [...]<|im_end|>\n`. Must be appended
+    // first (the system block follows BOS, before any user turn).
+    pub fn append_system(&mut self, text: &str) { ... }
+
+    // Generate; on each emitted tool call, dispatch to the callback, append the tool-role
+    // result, and continue — until the model answers with no tool call (or `max_rounds`).
+    pub fn assistant_turn_with_tools(
+        &mut self,
+        max_rounds: usize,
+        on_token: impl FnMut(u32, &str),
+        on_tool: impl FnMut(&ToolCall, &str),   // observe call + result (UI / logging)
+    ) -> Turn { ... }
+}
+```
+
+Driver loop:
+1. `append(ASSISTANT_OPEN)`, then `generate(...)`, **also stopping at `<|tool_call_end|>`**
+   (add it to the stop set when tools are registered) so we act without decoding the rest.
+2. Scan `turn.ids` for `<|tool_call_start|> … <|tool_call_end|>`. None ⇒ final answer: close
+   with `<|im_end|>\n` and return.
+3. Otherwise close the assistant turn, `parse_tool_calls`, invoke each `Tool::call`, append
+   `<|im_start|>tool\n{joined results}<|im_end|>\n`, and loop (bounded by `max_rounds`).
+
+### Example
+
+```rust
+use bebelm::agent::Agent;
+use bebelm::model::Model;
+use bebelm::tool::{Schema, Tool, Type::Int, Type::Str};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = Model::load("LFM2.5-8B-A1B-Q4_K_M.gguf")?;
+
+    // Register tools at build time (before the system block is emitted).
+    let mut agent = Agent::new(&model)
+        .add_tool(Tool::new(
+            "get_weather",
+            "Current weather for a city.",
+            Schema::new().req("city", Str, "City to look up"),
+            |c| {
+                let city = c.arg("city").unwrap_or("?");
+                format!(r#"{{"city":"{city}","temp_c":18,"sky":"clear"}}"#)
+            },
+        ))
+        .add_tool(Tool::new(
+            "add",
+            "Add two integers.",
+            Schema::new().req("a", Int, "First addend").req("b", Int, "Second addend"),
+            |c| {
+                // Args arrive as raw text; the callback parses what it needs.
+                let a: i64 = c.arg("a").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let b: i64 = c.arg("b").and_then(|s| s.parse().ok()).unwrap_or(0);
+                (a + b).to_string()
+            },
+        ));
+
+    agent.append_system("You are a helpful assistant.");
+    agent.append_user("What's the weather in Paris, and what is 21 + 21?");
+
+    // Run the agentic loop (≤ 8 tool rounds): stream answer tokens, and log each tool call.
+    let turn = agent.assistant_turn_with_tools(
+        8,
+        |_id, text| print!("{text}"),
+        |call, result| eprintln!("[tool] {} -> {result}", call.name),
+    );
+    println!("\n({} tokens)", turn.stats.generated_tokens);
+    Ok(())
+}
+```
+
+Behind the scenes this lays down one system block carrying both tool schemas
+(`List of tools: [{…get_weather…}, {…add…}]`), the user turn, and then — as the model
+calls `get_weather(city='Paris')` and `add(a=21, b=21)` — alternating `tool`-role results
+and reopened assistant turns, until the model produces a plain-text final answer.
+
+### Open design decisions
+
+- **String args, no serde** (default, matches the dependency ethos) vs. pulling in
+  `serde_json` for typed `Value` args/schemas (more ergonomic, first convenience dep).
+- **Automated loop on `Agent`** (it runs the tools) vs. returning control to the caller on
+  each tool call so the *application* dispatches (more flexible, more boilerplate).
+- **System/tools appended first** (explicit ordering, fits the append-only transcript) vs.
+  lazy auto-injection (awkward once BOS / the first turn is laid down).
