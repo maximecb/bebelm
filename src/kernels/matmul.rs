@@ -211,6 +211,11 @@ fn nibble_idot32(q: &[u8], qx: &[i8], high: bool) -> i32 {
 /// (`qx` = 256 int8, `sx` = block scale, `sums` = the 8 per-32 sub-block sums of `qx`):
 /// `Σ w·x = sx·(d·Σ_j sc_j·⟨q_w,q_x⟩_j − dmin·Σ_j m_j·Σq_x_j)`. The `⟨·,·⟩` are exact integer
 /// dots; only the activations carry Q8 rounding error.
+///
+/// `sc_j·⟨q_w,q_x⟩_j` and `m_j·Σq_x_j` are integer products, so both sums accumulate in `i32`
+/// (matching ggml) and convert to f32 only once at the end. `sd`'s worst case (sc≤63, |⟨⟩|≤32·15·127
+/// over 8 sub-blocks ≈ 31M) far exceeds f32's 2²⁴ exact-integer ceiling, so f32 accumulation would
+/// drop low bits; i32 (±2.1B) holds it exactly.
 #[inline(always)]
 fn dot_q4k_block_q8(block: &[u8], qx: &[i8], sx: f32, sums: &[i32]) -> f32 {
     let d = dequant::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -218,18 +223,18 @@ fn dot_q4k_block_q8(block: &[u8], qx: &[i8], sx: f32, sums: &[i32]) -> f32 {
     let scales = &block[4..16];
     let qs = &block[16..144];
 
-    let mut sd = 0.0f32; // Σ_j sc_j · ⟨q_w, q_x⟩_j
-    let mut sm = 0.0f32; // Σ_j m_j · Σ q_x_j
+    let mut sd = 0i32; // Σ_j sc_j · ⟨q_w, q_x⟩_j  (exact)
+    let mut sm = 0i32; // Σ_j m_j · Σ q_x_j         (exact)
     for c in 0..4 {
         let q = &qs[c * 32..c * 32 + 32];
         let (sc1, m1) = dequant::get_scale_min_k4(2 * c, scales);
         let (sc2, m2) = dequant::get_scale_min_k4(2 * c + 1, scales);
         let lo = nibble_idot32(q, &qx[(2 * c) * 32..], false);
         let hi = nibble_idot32(q, &qx[(2 * c + 1) * 32..], true);
-        sd += sc1 as f32 * lo as f32 + sc2 as f32 * hi as f32;
-        sm += m1 as f32 * sums[2 * c] as f32 + m2 as f32 * sums[2 * c + 1] as f32;
+        sd += sc1 as i32 * lo + sc2 as i32 * hi;
+        sm += m1 as i32 * sums[2 * c] + m2 as i32 * sums[2 * c + 1];
     }
-    sx * (d * sd - dmin * sm)
+    sx * (d * sd as f32 - dmin * sm as f32)
 }
 
 /// Q8-activation integer dot of a whole Q4_K weight row against pre-quantized activations.
@@ -648,6 +653,66 @@ mod tests {
                 assert_eq!(out[n_a + o], fused_row_dot(GgmlType::Q6_K, row, &x2), "job B row {o}");
             }
         }
+    }
+
+    /// Scalar fp32 reference for one Q4_K block: fully dequantize then compute the true dot.
+    /// Only exists in test builds — never pulled into release.
+    fn ref_dot_q4k_block_fp32(block: &[u8], x: &[f32]) -> f32 {
+        let mut weights = [0.0f32; 256];
+        dequant::dequantize_q4_k_block(block, &mut weights);
+        weights.iter().zip(x).map(|(&w, &xi)| w * xi).sum()
+    }
+
+    /// A deterministic, realistically-scaled Q4_K block + activations for the precision test.
+    /// Unlike `q4k_test_block` (which maxes out the 6-bit sub-block scales, inflating the
+    /// relative error), this uses a small super-block `d`/`dmin` and keeps every packed scale
+    /// byte < 64, so the dequantized weights land in a transformer-like range (~±0.25) and the
+    /// activations are O(1). A fixed-seed LCG fills the quants/scales/x so it's stable run-to-run.
+    fn realistic_q4k_block() -> (Vec<u8>, Vec<f32>) {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&0x1000u16.to_le_bytes()); // d    ≈ 0.000488 (f16)
+        block[2..4].copy_from_slice(&0x1c00u16.to_le_bytes()); // dmin ≈ 0.00391  (f16)
+        // 6-bit packed scales/mins: every byte < 64 keeps the extracted sc/m modest (no
+        // maxed-out scales) so d·sc·q stays in a realistic weight range.
+        for b in block[4..16].iter_mut() {
+            *b = (16 + next() % 32) as u8; // 16..47
+        }
+        // 4-bit quants: full nibble range, deterministic.
+        for b in block[16..144].iter_mut() {
+            *b = next() as u8;
+        }
+        // Activations: O(1), centered near zero — like a residual-stream vector.
+        let x: Vec<f32> = (0..256).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+        (block, x)
+    }
+
+    #[test]
+    fn dot_q4k_block_q8_precision_vs_fp32() {
+        // The Q8-activation integer dot vs the true fp32 dot (fully dequantized weights · true
+        // x). With realistic weight scales and O(1) activations, the only error is Q8
+        // quantization of x; the integer dot itself is exact. Inputs are deterministic, so the
+        // measured error is stable. Run single-threaded for determinism (single block anyway).
+        let (block, x) = realistic_q4k_block();
+        let reference = ref_dot_q4k_block_fp32(&block, &x);
+
+        let a = quantize_q8(&x);
+        let got = dot_q4k_block_q8(&block, &a.q[..256], a.scales[0], &a.sums[..8]);
+
+        // Measured relative error here is 0.0041545 (≈0.42%), in line with ggml's Q4_K×Q8_K
+        // accuracy. The whole test is deterministic and the result is bit-identical across
+        // platforms (exact integer dot; deterministic IEEE scaling/reduction), so the bound is
+        // set tight — ~8% over the measured value — to catch any precision regression early.
+        let rel = (got - reference).abs() / reference.abs();
+        assert!(
+            rel < 0.0045,
+            "dot_q4k_block_q8 vs fp32 ref: got={got:.6}, ref={reference:.6}, rel={rel:.7}"
+        );
     }
 
     #[test]
