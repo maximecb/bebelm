@@ -1,6 +1,6 @@
 [package]
 name = "bebelm"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "CPU-only, pure-Rust inference for Liquid AI LFM2.5-8B-A1B (Q4_K_M)"
 license = "MIT"
