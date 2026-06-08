@@ -59,7 +59,7 @@ jobs:
       # `--ignored` (no `--test` filter) runs every ignored test across all binaries, so
       # future e2e tests are picked up automatically once marked `#[ignore]`.
       - name: Run end-to-end model tests
-        run: cargo test --release -- --ignored
+        run: cargo test --release -- --ignored --test-threads=1
 
       # Benchmark + correctness smoke test via the CLI binary: greedily generates 64 tokens
       # and asserts the reply mentions Paris (robust across builds/arches; no exact-id gate).

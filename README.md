@@ -300,7 +300,7 @@ The test suite has two layers:
 Run the **full** end-to-end suite — every `#[ignore]`d test — with `--ignored`:
 
 ```sh
-cargo test --release -- --ignored
+cargo test --release -- --ignored --test-threads=1
 ```
 
 Each test loads the model independently and runs real decoding, so the full suite is slow. For

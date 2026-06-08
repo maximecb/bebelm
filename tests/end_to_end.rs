@@ -5,7 +5,7 @@
 //! explicitly once the weights are present:
 //!
 //! ```sh
-//! cargo test --release -- --ignored
+//! cargo test --release -- --ignored --test-threads=1
 //! ```
 //!
 //! The weights path comes from `$BEBELM_WEIGHTS_FILE`, defaulting to the GGUF in the repo
@@ -227,4 +227,54 @@ fn tool_call_add_round_trip() {
         "expected the final answer to state 42, got:\n{}",
         turn.text
     );
+}
+
+/// Multiple tool calls, end to end: register a `get_age` tool, ask a question that needs it
+/// for several people, and run the agentic loop. We assert that the model calls the tool
+/// multiple times and produces a Markdown table with the results.
+#[test]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+fn tool_call_multi_get_age_table() {
+    let model = load_model();
+    let mut agent = Agent::new(&model).greedy().max_think(512).max_gen(1024).add_tool(Tool::new(
+        "get_age",
+        "Retrieve the age of a person given their name.",
+        Schema::new().req("name", Type::Str, "The name of the person to look up"),
+        |c| {
+            let name = c.arg("name").unwrap_or("");
+            match name {
+                "Alice" => "25".to_string(),
+                "Bob" => "30".to_string(),
+                "Charlie" => "35".to_string(),
+                _ => "unknown".to_string(),
+            }
+        },
+    ));
+    agent.append_system("You are a helpful assistant with access to tools. Use the get_age tool to find ages for multiple people when requested.");
+    agent.append_user("I need the ages of Alice, Bob, and Charlie. Use the get_age tool for each, then present the results in a Markdown table.");
+
+    let mut calls: Vec<(String, String)> = Vec::new();
+
+    let turn = agent.assistant_turn_with_tools(
+        4,
+        |_id, _text| {},
+        |call, result| calls.push((call.name.clone(), result.to_string())),
+    );
+
+    dbg!(&turn.text);
+
+    // We expect 3 calls to get_age.
+    let get_age_calls: Vec<_> = calls.iter().filter(|(name, _)| name == "get_age").collect();
+    assert_eq!(get_age_calls.len(), 3, "expected 3 calls to get_age, got: {calls:?}");
+
+    // Check that results are in the table.
+    let out = &turn.text;
+    for (name, age) in [("Alice", "25"), ("Bob", "30"), ("Charlie", "35")] {
+        assert!(out.contains(name), "table is missing name {name:?}, got:\n{out}");
+        assert!(out.contains(age), "table is missing age {age:?} for {name:?}, got:\n{out}");
+    }
+
+    // It should be a table.
+    let pipes = out.matches('|').count();
+    assert!(pipes >= 6, "expected a Markdown table, found {pipes} pipes in:\n{out}");
 }

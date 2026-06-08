@@ -198,17 +198,18 @@ impl<'m> Agent<'m> {
     /// Call this first (the system block follows BOS, before any user turn) and after all
     /// [`add_tool`](Self::add_tool) calls.
     pub fn append_system(&mut self, text: &str) {
-        let mut block = format!("<|im_start|>system\n{text}");
+        let mut block = String::from("<|im_start|>system\n");
         if !self.tools.is_empty() {
-            block.push_str("\nList of tools: [");
+            block.push_str("List of tools: [");
             for (i, tool) in self.tools.iter().enumerate() {
                 if i > 0 {
                     block.push_str(", ");
                 }
                 block.push_str(tool.schema());
             }
-            block.push(']');
+            block.push_str("]\n\n");
         }
+        block.push_str(text);
         block.push_str("<|im_end|>\n");
         self.append(&block);
     }
