@@ -134,12 +134,16 @@ fn expand_file_refs(line: &str) -> Result<String, String> {
 
     for word in line.split_whitespace() {
         let Some(path) = word.strip_prefix('@') else { continue };
+        let path = path.trim_end_matches(&[',', '.', '?', '!', ':']);
+
         if path.is_empty() || seen.contains(&path) {
             continue;
         }
         seen.push(path);
+
         let bytes = std::fs::read(path).map_err(|e| format!("@{path}: {e}"))?;
         let text = String::from_utf8(bytes).map_err(|_| format!("@{path}: not valid UTF-8"))?;
+
         blocks.push_str("\n```");
         blocks.push_str(path);
         blocks.push('\n');
@@ -153,5 +157,6 @@ fn expand_file_refs(line: &str) -> Result<String, String> {
     if blocks.is_empty() {
         return Ok(line.to_string());
     }
+
     Ok(format!("{line}\n{blocks}"))
 }
