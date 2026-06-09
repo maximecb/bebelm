@@ -296,3 +296,55 @@ fn tool_call_multi_get_age_table() {
     let pipes = out.matches('|').count();
     assert!(pipes >= 6, "expected a Markdown table, found {pipes} pipes in:\n{out}");
 }
+
+/// Compare the model's output against a "golden" completion from llama.cpp, stored in
+/// `tests/golden_prompt.txt`. This is a strict regression test for the whole pipeline's
+/// numeric accuracy.
+///
+/// To run this test manually:
+/// cargo test --release --features golden-test --test end_to_end golden_prompt_matches_llama -- --ignored --nocapture
+#[test]
+#[cfg(feature = "golden-test")]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release --features golden-test -- --ignored`"]
+fn golden_prompt_matches_llama() {
+    // Limit Rayon to a single thread for this test to match the llama.cpp benchmark settings.
+    // This is a global, one-shot setting; we ignore errors if the pool was already built.
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
+
+    let model = load_model();
+    let golden = include_str!("golden_prompt.txt");
+
+    // Filter out comment lines and replace the placeholder thinking markers with the real
+    // special tokens used by the model/tokenizer.
+    let expected_text = golden
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .replace("[Start thinking]", "<think>")
+        .replace("[End thinking]", "</think>");
+
+    // Tokenize the golden completion (without a BOS, as the Agent adds it to the prompt).
+    let expected_ids = model.tokenizer().encode(&expected_text, false);
+
+    let mut agent = Agent::new(&model).greedy().max_think(1024).max_gen(1024);
+    agent.append_user("Hello. Can you tell me about the capital of France and its landmarks?");
+    let mut match_count = 0;
+    let _turn = agent.assistant_turn(|id, _piece| {
+        if match_count < expected_ids.len() {
+            if id != expected_ids[match_count] {
+                panic!(
+                    "greedy output diverged at token {} (got {}, expected {})",
+                    match_count, id, expected_ids[match_count]
+                );
+            }
+            match_count += 1;
+        } else {
+            panic!("greedy output exceeded expected length at token {}", match_count);
+        }
+    });
+
+    println!("Golden prompt match: {}/{} tokens", match_count, expected_ids.len());
+    assert_eq!(match_count, expected_ids.len(), "model stopped before completing the golden prompt");
+}
