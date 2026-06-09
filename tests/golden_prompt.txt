@@ -1,3 +1,4 @@
+# Completion generated with:
 # ./build/bin/llama-cli -m ../bebelm/LFM2.5-8B-A1B-Q4_K_M.gguf \
 #  --prompt "$(printf '<|im_start|>user\nHello. Can you tell me about the capital of France and its landmarks?<|im_end|>\n<|im_start|>assistant\n')" \
 #  --temp 0 \
@@ -6,6 +7,9 @@
 #  -ngl 0 \
 #  -t 1 \
 #  --no-display-prompt
+#
+# Equivalent bebelm command:
+# cargo run --release -- generate --num-threads 1 --greedy "$(printf '<|im_start|>user\nHello. Can you tell me about the capital of France and its landmarks?<|im_end|>\n<|im_start|>assistant\n')"
 
 [Start thinking]
 
