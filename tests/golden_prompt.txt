@@ -1,0 +1,28 @@
+# ./build/bin/llama-cli -m ../bebelm/LFM2.5-8B-A1B-Q4_K_M.gguf \
+#  --prompt "$(printf '<|im_start|>user\nHello. Can you tell me about the capital of France and its landmarks?<|im_end|>\n<|im_start|>assistant\n')" \
+#  --temp 0 \
+#  -n 512 \
+#  -c 2048 \
+#  -ngl 0 \
+#  -t 1 \
+#  --no-display-prompt
+
+[Start thinking]
+
+The user asks: "Hello. Can you tell me about the capital of France and its landmarks?" This is a straightforward request for factual information. There's no disallowed content. Provide a concise answer describing Paris, its landmarks: Eiffel Tower, Louvre, Notre-Dame, Arc de Triomphe, Sacré-Cœur, etc. Possibly include brief description. No extra formatting unless requested. The system says no markdown unless asked. So plain text. Provide answer. Ensure no disallowed content. Provide helpful info. No extra commentary. Let's comply.
+
+[End thinking]
+
+
+The capital of France is Paris, often called the “City of Light.” It is renowned for its historic and cultural landmarks, among which are:
+
+- **Eiffel Tower** – The iconic iron lattice tower on the Champ de Mars, offering panoramic views of the city.
+- **Louvre Museum** – One of the world’s largest art museums, home to masterpieces such as the Mona Lisa and the Venus de Milo.
+- **Notre‑Dame Cathedral** – A masterpiece of French Gothic architecture on the Île de la Cité, famous for its flying buttresses, gargoyles, and stained‑glass rose windows.
+- **Arc de Triomphe** – Standing at the western end of the Champs‑Élysées, this monumental arch honors those who fought for France.
+- **Sacré‑Cœur Basilica** – Located on the hill of Montmartre, this white domed basilica provides sweeping city views and a tranquil atmosphere.
+- **Musée d’Orsay** – Housed in a former railway station, it showcases Impressionist and Post‑Impressionist art.
+- **Palace of Versailles** – Though technically a suburb of Paris, this former royal residence is famed for its opulent Hall of Mirrors, extensive gardens, and the famous “Hall of the Mirror.”
+- **Notre‑Dame’s surrounding Île de la Cité** – The historic island that also contains the Sainte‑Chapelle, a stunning Gothic chapel known for its rose windows.
+
+These landmarks, along with the city’s cafés, boulevards, and vibrant neighborhoods, make Paris a major cultural and tourist hub.
