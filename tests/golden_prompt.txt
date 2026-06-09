@@ -12,12 +12,8 @@
 # cargo run --release -- generate --num-threads 1 --greedy "$(printf '<|im_start|>user\nHello. Can you tell me about the capital of France and its landmarks?<|im_end|>\n<|im_start|>assistant\n')"
 
 [Start thinking]
-
 The user asks: "Hello. Can you tell me about the capital of France and its landmarks?" This is a straightforward request for factual information. There's no disallowed content. Provide a concise answer describing Paris, its landmarks: Eiffel Tower, Louvre, Notre-Dame, Arc de Triomphe, Sacré-Cœur, etc. Possibly include brief description. No extra formatting unless requested. The system says no markdown unless asked. So plain text. Provide answer. Ensure no disallowed content. Provide helpful info. No extra commentary. Let's comply.
-
 [End thinking]
-
-
 The capital of France is Paris, often called the “City of Light.” It is renowned for its historic and cultural landmarks, among which are:
 
 - **Eiffel Tower** – The iconic iron lattice tower on the Champ de Mars, offering panoramic views of the city.
