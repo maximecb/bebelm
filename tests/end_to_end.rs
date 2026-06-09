@@ -44,6 +44,24 @@ fn capital_of_france_is_paris() {
     );
 }
 
+/// Greedy instruction following to correct a misspelled sentence. This exercises
+/// the model's ability to handle noisy input and perform basic text editing.
+#[test]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+fn spellchecking_correction() {
+    let model = load_model();
+
+    let mut agent = Agent::new(&model).greedy().max_think(200).max_gen(64);
+    agent.append_user("Please correct the spelling in this sentence: 'I am goign to the park tomorow.' Output only the corrected sentence.");
+    let turn = agent.assistant_turn(|_id, _piece| {});
+
+    assert!(
+        turn.text.contains("going") && turn.text.contains("tomorrow"),
+        "expected the corrected sentence to contain 'going' and 'tomorrow', got {:?}",
+        turn.text
+    );
+}
+
 /// A ChatML instruction turn that asks the model to render a small CSV as a Markdown table.
 /// This exercises instruction following over inlined file content and multi-line structured
 /// output. We assert robust signals: every source row's name is reproduced, and the reply
