@@ -10,6 +10,7 @@ This is a library crate which can be imported into your Rust projects, and it's 
 via [crates.io](https://crates.io/crates/bebelm). There is also a basic command-line
 interface that you can use.
 
+The model needs about ~6-8GB of RAM to run (depending on context length).
 BebeLM was tested on an M5 CPU as well as Ryzen 7x and Threadripper CPUs. It should work
 on Intel and on Raspberry Pi 4/5 as well, but this is untested.
 
