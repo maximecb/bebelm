@@ -14,9 +14,9 @@ use crate::cache::Cache;
 use crate::gguf::{GgufFile, TensorInfo};
 use crate::kernels::activation::{sigmoid_slice, swiglu};
 use crate::kernels::attention::attention_decode;
-use crate::kernels::conv::conv_step;
+use crate::kernels::conv::{conv_prefill, conv_step};
 use crate::kernels::elementwise::{add_assign, add_scaled};
-use crate::kernels::matmul::{matvec, matvec_fused_batch, quantize_q8, FusedJob, Q8Vec};
+use crate::kernels::matmul::{matmul, matvec, matvec_fused_batch, quantize_q8, FusedJob, Q8Vec};
 use crate::kernels::rmsnorm::rmsnorm;
 use crate::kernels::rope::rope_neox;
 use crate::tensor::GgmlType;
@@ -127,6 +127,253 @@ impl Model {
 
         cache.pos += 1;
         h
+    }
+
+    // --- forward pass (batched prefill) ---
+
+    /// Embed + run the 24 decoder layers for a **batch** of `tokens` (positions
+    /// `cache.pos .. cache.pos + tokens.len()`), updating the KV/conv caches and `cache.pos`,
+    /// and returning the batch's final hidden states (token-major, `tokens.len() × HIDDEN`).
+    ///
+    /// This is the batched analogue of [`run_layers`](Self::run_layers): the weight projections
+    /// run once over all tokens via [`matmul`] (reading each weight row once instead of once per
+    /// token — opt 9f), while the cheap per-token ops (norm, RoPE, SDPA, conv, SwiGLU, MoE
+    /// routing) loop over the batch reusing the same kernels as decode. Every output is computed
+    /// by the identical arithmetic the per-token path uses, so the caches it leaves — and hence
+    /// the subsequent decode — are **bit-for-bit identical** to prefilling token by token.
+    ///
+    /// The caller must ensure the batch does not overflow the KV window (no mid-batch sliding);
+    /// [`crate::agent::Agent`] only batches when the whole prompt fits, falling back otherwise.
+    pub(crate) fn run_layers_batch(&self, tokens: &[u32], cache: &mut Cache) -> Vec<f32> {
+        let t = tokens.len();
+        let pos0 = cache.pos;
+        let mut h = vec![0.0f32; t * HIDDEN];
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.embed_token(tok, &mut h[i * HIDDEN..(i + 1) * HIDDEN]);
+        }
+
+        for layer in 0..N_LAYERS {
+            let normed = self.norm_batch(&h, &name(layer, "attn_norm.weight"), t);
+            let op = if config::is_attention(layer) {
+                self.attn_batch(layer, &normed, pos0, t, cache)
+            } else {
+                self.conv_batch(layer, &normed, t, cache)
+            };
+            add_assign(&mut h, &op);
+
+            let normed = self.norm_batch(&h, &name(layer, "ffn_norm.weight"), t);
+            let ffn = if config::is_dense_ffn(layer) {
+                self.dense_ffn_batch(layer, &normed, t)
+            } else {
+                self.moe_ffn_batch(layer, &normed, t)
+            };
+            add_assign(&mut h, &ffn);
+        }
+
+        cache.pos += t;
+        h
+    }
+
+    /// RMSNorm each of the `t` token rows of `h` (token-major `t × HIDDEN`) with the named gain.
+    fn norm_batch(&self, h: &[f32], gain_name: &str, t: usize) -> Vec<f32> {
+        let gain = self.f32(gain_name);
+        let mut out = vec![0.0f32; t * HIDDEN];
+        for (hi, oi) in h.chunks_exact(HIDDEN).zip(out.chunks_exact_mut(HIDDEN)) {
+            rmsnorm(hi, gain, RMS_EPS, oi);
+        }
+        out
+    }
+
+    /// Batched gated short-conv operator: in/out projections run over all `t` tokens via
+    /// [`matmul`]; the depthwise conv runs over the batch's positions via [`conv_prefill`],
+    /// consuming and updating the conv-state cache.
+    fn conv_batch(&self, layer: usize, x: &[f32], t: usize, cache: &mut Cache) -> Vec<f32> {
+        let mut bcx = vec![0.0f32; t * 3 * HIDDEN];
+        self.matmul1(&name(layer, "shortconv.in_proj.weight"), x, HIDDEN, 3 * HIDDEN, t, &mut bcx);
+
+        // Bx = B · x_gate (chunks 0 and 2 of in_proj) per token.
+        let mut bx = vec![0.0f32; t * HIDDEN];
+        for i in 0..t {
+            let base = i * 3 * HIDDEN;
+            for (c, bxc) in bx[i * HIDDEN..(i + 1) * HIDDEN].iter_mut().enumerate() {
+                *bxc = bcx[base + c] * bcx[base + 2 * HIDDEN + c];
+            }
+        }
+
+        let conv_w = self.f32(&name(layer, "shortconv.conv.weight"));
+        let mut conv_out = vec![0.0f32; t * HIDDEN];
+        conv_prefill(&mut cache.conv[layer], &bx, conv_w, HIDDEN, CONV_L_CACHE, t, &mut conv_out);
+
+        // y = C · conv_out (chunk 1) per token, then out_proj.
+        let mut y = vec![0.0f32; t * HIDDEN];
+        for i in 0..t {
+            let base = i * 3 * HIDDEN;
+            for (c, yc) in y[i * HIDDEN..(i + 1) * HIDDEN].iter_mut().enumerate() {
+                *yc = bcx[base + HIDDEN + c] * conv_out[i * HIDDEN + c];
+            }
+        }
+        let mut out = vec![0.0f32; t * HIDDEN];
+        self.matmul1(&name(layer, "shortconv.out_proj.weight"), &y, HIDDEN, HIDDEN, t, &mut out);
+        out
+    }
+
+    /// Batched GQA attention operator: q/k/v/o projections run over all `t` tokens via [`matmul`];
+    /// each token is then q/k-normed + RoPE'd at its own position, appended to the KV cache, and
+    /// attended over the cache prefix it can see (causal by construction — token `i` attends to
+    /// the `pos0 + i + 1` keys present once its own k/v are appended).
+    fn attn_batch(&self, layer: usize, x: &[f32], pos0: usize, t: usize, cache: &mut Cache) -> Vec<f32> {
+        let mut q = vec![0.0f32; t * HIDDEN];
+        let mut k = vec![0.0f32; t * KV_DIM];
+        let mut v = vec![0.0f32; t * KV_DIM];
+        self.matmul1(&name(layer, "attn_q.weight"), x, HIDDEN, HIDDEN, t, &mut q);
+        self.matmul1(&name(layer, "attn_k.weight"), x, HIDDEN, KV_DIM, t, &mut k);
+        self.matmul1(&name(layer, "attn_v.weight"), x, HIDDEN, KV_DIM, t, &mut v);
+
+        let q_gain = self.f32(&name(layer, "attn_q_norm.weight"));
+        let k_gain = self.f32(&name(layer, "attn_k_norm.weight"));
+        for i in 0..t {
+            norm_rope_heads(&mut q[i * HIDDEN..(i + 1) * HIDDEN], N_HEADS, q_gain, pos0 + i);
+            norm_rope_heads(&mut k[i * KV_DIM..(i + 1) * KV_DIM], N_KV_HEADS, k_gain, pos0 + i);
+        }
+
+        let mut attn = vec![0.0f32; t * HIDDEN];
+        for i in 0..t {
+            cache.k[layer].extend_from_slice(&k[i * KV_DIM..(i + 1) * KV_DIM]);
+            cache.v[layer].extend_from_slice(&v[i * KV_DIM..(i + 1) * KV_DIM]);
+            let n_ctx = cache.k[layer].len() / KV_DIM;
+            attention_decode(
+                &q[i * HIDDEN..(i + 1) * HIDDEN],
+                &cache.k[layer],
+                &cache.v[layer],
+                n_ctx,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                &mut attn[i * HIDDEN..(i + 1) * HIDDEN],
+            );
+        }
+
+        let mut out = vec![0.0f32; t * HIDDEN];
+        self.matmul1(&name(layer, "attn_output.weight"), &attn, HIDDEN, HIDDEN, t, &mut out);
+        out
+    }
+
+    /// Batched dense SwiGLU MLP (layers 0,1): gate/up/down projections run over all `t` tokens.
+    fn dense_ffn_batch(&self, layer: usize, x: &[f32], t: usize) -> Vec<f32> {
+        let mut gate = vec![0.0f32; t * DENSE_FF];
+        let mut up = vec![0.0f32; t * DENSE_FF];
+        self.matmul1(&name(layer, "ffn_gate.weight"), x, HIDDEN, DENSE_FF, t, &mut gate);
+        self.matmul1(&name(layer, "ffn_up.weight"), x, HIDDEN, DENSE_FF, t, &mut up);
+        let mut act = vec![0.0f32; t * DENSE_FF];
+        for ((g, u), a) in gate
+            .chunks_exact(DENSE_FF)
+            .zip(up.chunks_exact(DENSE_FF))
+            .zip(act.chunks_exact_mut(DENSE_FF))
+        {
+            swiglu(g, u, a);
+        }
+        let mut out = vec![0.0f32; t * HIDDEN];
+        self.matmul1(&name(layer, "ffn_down.weight"), &act, DENSE_FF, HIDDEN, t, &mut out);
+        out
+    }
+
+    /// Batched MoE FFN (token-grouped, opt 9f). Routing is per token, but each expert's
+    /// gate/up/down then run **once over all the tokens that selected it** via [`matmul`] —
+    /// reading the expert's weights once per batch instead of once per (token, expert). This is
+    /// **bit-for-bit identical** to running [`moe_ffn`](Self::moe_ffn) per token: every expert
+    /// output equals the per-token matvec (proven for [`matmul`]), and each token's experts are
+    /// summed back in the same selection order with the same weights.
+    fn moe_ffn_batch(&self, layer: usize, x: &[f32], t: usize) -> Vec<f32> {
+        let router = self.tensor(&name(layer, "ffn_gate_inp.weight")).expect("router");
+        let bias = self.f32(&name(layer, "exp_probs_b.bias"));
+        let gate_exps = self.tensor(&name(layer, "ffn_gate_exps.weight")).expect("gate_exps");
+        let up_exps = self.tensor(&name(layer, "ffn_up_exps.weight")).expect("up_exps");
+        let down_exps = self.tensor(&name(layer, "ffn_down_exps.weight")).expect("down_exps");
+        let gate_stride = expert_bytes(gate_exps.ggml_type, HIDDEN, MOE_FF);
+        let up_stride = expert_bytes(up_exps.ggml_type, HIDDEN, MOE_FF);
+        let down_stride = expert_bytes(down_exps.ggml_type, MOE_FF, HIDDEN);
+
+        // Route every token (batched router), then per token: sigmoid → top-k by (score+bias) →
+        // normalize the selected sigmoid scores. `sel`/`wts` are token-major `t × N_EXPERTS_USED`,
+        // in score-descending (selection) order — exactly as `moe_ffn` computes them.
+        let mut scores = vec![0.0f32; t * N_EXPERTS];
+        matmul(router.ggml_type, self.data(router), HIDDEN, N_EXPERTS, x, t, &mut scores);
+        let mut sel = vec![0usize; t * N_EXPERTS_USED];
+        let mut wts = vec![0.0f32; t * N_EXPERTS_USED];
+        for i in 0..t {
+            let sc = &mut scores[i * N_EXPERTS..(i + 1) * N_EXPERTS];
+            sigmoid_slice(sc);
+            let mut order: Vec<usize> = (0..N_EXPERTS).collect();
+            order.sort_unstable_by(|&a, &b| (sc[b] + bias[b]).total_cmp(&(sc[a] + bias[a])));
+            let chosen = &order[..N_EXPERTS_USED];
+            let denom: f32 = chosen.iter().map(|&e| sc[e]).sum::<f32>() + 1e-6;
+            for (k, &e) in chosen.iter().enumerate() {
+                sel[i * N_EXPERTS_USED + k] = e;
+                wts[i * N_EXPERTS_USED + k] = sc[e] / denom;
+            }
+        }
+
+        // Group each (token, slot) by the expert it selected.
+        let mut groups: Vec<Vec<(usize, usize)>> = vec![Vec::new(); N_EXPERTS];
+        for i in 0..t {
+            for k in 0..N_EXPERTS_USED {
+                groups[sel[i * N_EXPERTS_USED + k]].push((i, k));
+            }
+        }
+
+        // Per expert with members: gather its tokens' inputs, run gate+up → SwiGLU → down over the
+        // whole group at once, and scatter each result into its (token, slot) row.
+        let gate_data = self.data(gate_exps);
+        let up_data = self.data(up_exps);
+        let down_data = self.data(down_exps);
+        let mut slots = vec![0.0f32; t * N_EXPERTS_USED * HIDDEN]; // (token, slot) → down output
+        for (e, members) in groups.iter().enumerate() {
+            if members.is_empty() {
+                continue;
+            }
+            let g = members.len();
+            let mut xe = vec![0.0f32; g * HIDDEN];
+            for (j, &(i, _)) in members.iter().enumerate() {
+                xe[j * HIDDEN..(j + 1) * HIDDEN].copy_from_slice(&x[i * HIDDEN..(i + 1) * HIDDEN]);
+            }
+
+            let mut gate = vec![0.0f32; g * MOE_FF];
+            let mut up = vec![0.0f32; g * MOE_FF];
+            matmul(gate_exps.ggml_type, &gate_data[e * gate_stride..(e + 1) * gate_stride], HIDDEN, MOE_FF, &xe, g, &mut gate);
+            matmul(up_exps.ggml_type, &up_data[e * up_stride..(e + 1) * up_stride], HIDDEN, MOE_FF, &xe, g, &mut up);
+            let mut act = vec![0.0f32; g * MOE_FF];
+            for ((gx, ux), ax) in gate
+                .chunks_exact(MOE_FF)
+                .zip(up.chunks_exact(MOE_FF))
+                .zip(act.chunks_exact_mut(MOE_FF))
+            {
+                swiglu(gx, ux, ax);
+            }
+            let mut down = vec![0.0f32; g * HIDDEN];
+            matmul(down_exps.ggml_type, &down_data[e * down_stride..(e + 1) * down_stride], MOE_FF, HIDDEN, &act, g, &mut down);
+
+            for (j, &(i, k)) in members.iter().enumerate() {
+                let slot = i * N_EXPERTS_USED + k;
+                slots[slot * HIDDEN..(slot + 1) * HIDDEN].copy_from_slice(&down[j * HIDDEN..(j + 1) * HIDDEN]);
+            }
+        }
+
+        // Weighted sum per token over its selected experts, in selection order (as `moe_ffn`).
+        let mut out = vec![0.0f32; t * HIDDEN];
+        for i in 0..t {
+            let oi = &mut out[i * HIDDEN..(i + 1) * HIDDEN];
+            for k in 0..N_EXPERTS_USED {
+                let slot = i * N_EXPERTS_USED + k;
+                add_scaled(oi, &slots[slot * HIDDEN..(slot + 1) * HIDDEN], wts[i * N_EXPERTS_USED + k]);
+            }
+        }
+        out
+    }
+
+    /// Batched [`matvec1`](Self::matvec1): `Y = W·X` over `n_tokens` token-major columns.
+    fn matmul1(&self, tensor: &str, x: &[f32], n_in: usize, n_out: usize, n_tokens: usize, out: &mut [f32]) {
+        let tt = self.tensor(tensor).expect("matmul1: tensor");
+        matmul(tt.ggml_type, self.data(tt), n_in, n_out, x, n_tokens, out);
     }
 
     /// Final RMSNorm + tied logits (`token_embd · h`) for a hidden state.
@@ -409,6 +656,50 @@ pub fn expected_tensors() -> Vec<(String, Vec<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Cache;
+
+    /// Batched prefill must be **bit-for-bit identical** to prefilling token by token: same KV /
+    /// conv caches and same final logits. This is the core correctness guarantee of opt 9f, so
+    /// the comparison is exact (`assert_eq` on f32), not tolerance-based. Also checks that
+    /// chunking the batch (the [`crate::agent`] does this) changes nothing. Loads the full GGUF,
+    /// so it is `#[ignore]`d like the other end-to-end tests.
+    #[test]
+    #[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+    fn batched_prefill_matches_per_token() {
+        let path = std::env::var("BEBELM_WEIGHTS_FILE")
+            .unwrap_or_else(|_| "./LFM2.5-8B-A1B-Q4_K_M.gguf".to_string());
+        let model = Model::load(&path).expect("load weights");
+        // A multi-token prompt that exercises conv + both attention and several MoE layers.
+        let ids = model
+            .tokenizer()
+            .encode("The capital of France is Paris, a historic city of light and art.", true);
+        assert!(ids.len() >= 6, "need a few tokens to prefill, got {}", ids.len());
+        let (&last, rest) = ids.split_last().unwrap();
+
+        // Reference: per-token prefill.
+        let mut ca = Cache::new();
+        for &tok in rest {
+            model.run_layers(tok, &mut ca);
+        }
+        let logits_a = model.forward_step(last, &mut ca);
+
+        // One-shot batched, and chunked batched (chunk 3 < rest.len()) — both must match exactly.
+        for chunk in [rest.len(), 3] {
+            let mut cb = Cache::new();
+            for part in rest.chunks(chunk) {
+                model.run_layers_batch(part, &mut cb);
+            }
+            let logits_b = model.forward_step(last, &mut cb);
+
+            assert_eq!(ca.pos, cb.pos, "pos (chunk {chunk})");
+            for l in 0..N_LAYERS {
+                assert_eq!(ca.k[l], cb.k[l], "k cache layer {l} (chunk {chunk})");
+                assert_eq!(ca.v[l], cb.v[l], "v cache layer {l} (chunk {chunk})");
+                assert_eq!(ca.conv[l], cb.conv[l], "conv cache layer {l} (chunk {chunk})");
+            }
+            assert_eq!(logits_a, logits_b, "final logits (chunk {chunk})");
+        }
+    }
 
     #[test]
     fn expected_tensor_count_matches_file() {

@@ -38,6 +38,37 @@ pub fn conv_step(
     }
 }
 
+/// Batched (prefill) causal depthwise conv over `n_tokens` consecutive positions.
+///
+/// `bx` and `out` are token-major (`bx[t*channels + c]`, oldest position first). `state` holds
+/// the `l_cache-1` columns *preceding* this batch (oldest first, `channels` each), exactly as
+/// the decode [`conv_step`] cache does; on return it holds the batch's trailing `l_cache-1`
+/// columns, ready for the next step. The result is **bit-for-bit identical** to running
+/// `conv_step` once per position with the rolling state update — it *is* that loop, hoisted here
+/// so the conv operator processes the whole prompt in one call (its in/out projections batch via
+/// `matmul`).
+pub fn conv_prefill(
+    state: &mut [f32],
+    bx: &[f32],
+    weight: &[f32],
+    channels: usize,
+    l_cache: usize,
+    n_tokens: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(state.len(), channels * (l_cache - 1));
+    debug_assert_eq!(bx.len(), channels * n_tokens);
+    debug_assert_eq!(out.len(), channels * n_tokens);
+
+    for t in 0..n_tokens {
+        let bx_t = &bx[t * channels..(t + 1) * channels];
+        conv_step(state, bx_t, weight, channels, l_cache, &mut out[t * channels..(t + 1) * channels]);
+        // Slide the state left one column and append this position's Bx (matches conv_step_op).
+        state.copy_within(channels.., 0);
+        state[(l_cache - 2) * channels..].copy_from_slice(bx_t);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +99,35 @@ mod tests {
         let mut out = [0.0f32; 1];
         conv_step(&[0.0, 0.0], &[4.0], &weight, 1, 3, &mut out);
         assert_eq!(out, [400.0]);
+    }
+
+    #[test]
+    fn prefill_matches_rolling_conv_step() {
+        // conv_prefill must be bit-identical to conv_step rolled per position with the same
+        // state update. 3 channels, l_cache 3, 5 positions, a non-trivial initial state.
+        let channels = 3;
+        let l_cache = 3;
+        let n = 5;
+        let weight: Vec<f32> = (0..channels * l_cache).map(|i| (i as f32 - 4.0) * 0.5).collect();
+        let bx: Vec<f32> = (0..channels * n).map(|i| ((i % 7) as f32 - 3.0) * 0.3).collect();
+        let init_state: Vec<f32> = (0..channels * (l_cache - 1)).map(|i| (i as f32 + 1.0) * 0.1).collect();
+
+        // Reference: the per-token loop (what conv_step_op does).
+        let mut ref_state = init_state.clone();
+        let mut ref_out = vec![0.0f32; channels * n];
+        for t in 0..n {
+            let bx_t = &bx[t * channels..(t + 1) * channels];
+            conv_step(&ref_state, bx_t, &weight, channels, l_cache, &mut ref_out[t * channels..(t + 1) * channels]);
+            ref_state.copy_within(channels.., 0);
+            ref_state[(l_cache - 2) * channels..].copy_from_slice(bx_t);
+        }
+
+        let mut state = init_state.clone();
+        let mut out = vec![0.0f32; channels * n];
+        conv_prefill(&mut state, &bx, &weight, channels, l_cache, n, &mut out);
+
+        assert_eq!(out, ref_out, "outputs differ");
+        assert_eq!(state, ref_state, "final state differs");
     }
 
     #[test]

@@ -25,6 +25,11 @@ const DEFAULT_MAX_GEN: usize = 2048;
 /// decoding can continue. A conservative session default; the model supports far more.
 const DEFAULT_MAX_CONTEXT: usize = 32_768;
 
+/// Prompt tokens prefilled per batched [`Model::run_layers_batch`] call. Larger chunks amortize
+/// the fork/join and weight passes better; smaller ones bound the transient per-batch buffers.
+/// Chunking is numerically transparent — each token still attends to the full cache prefix.
+const PREFILL_CHUNK: usize = 512;
+
 /// Text appended to open an assistant turn before generating its reply.
 const ASSISTANT_OPEN: &str = "<|im_start|>assistant\n";
 
@@ -335,9 +340,20 @@ impl<'m> Agent<'m> {
         let (&last, rest) = self.history[self.cache.pos..]
             .split_last()
             .expect("generate: no pending tokens to generate from");
-        for &tok in rest {
-            self.model.run_layers(tok, &mut self.cache);
-            Self::trim_context(&mut self.cache, self.max_context);
+        // Prefill every pending token except the last. When the whole batch fits the KV window
+        // (no mid-prefill sliding), run it as a batched GEMM in chunks (opt 9f) — bit-identical to
+        // the per-token path but with each weight read once per chunk instead of once per token.
+        // If the window would slide mid-prefill, fall back to the per-token loop so the eviction
+        // points match exactly.
+        if self.cache.kv_len() + rest.len() <= self.max_context {
+            for chunk in rest.chunks(PREFILL_CHUNK) {
+                self.model.run_layers_batch(chunk, &mut self.cache);
+            }
+        } else {
+            for &tok in rest {
+                self.model.run_layers(tok, &mut self.cache);
+                Self::trim_context(&mut self.cache, self.max_context);
+            }
         }
         let mut logits = self.model.forward_step(last, &mut self.cache);
         Self::trim_context(&mut self.cache, self.max_context);
