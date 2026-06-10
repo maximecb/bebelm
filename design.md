@@ -455,10 +455,14 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | **9k ⚠️** | **Vectorize the K-quant unpack** — replace the per-lane scalar gather in `nibble_dot32` with in-vector `wide` widening (`u8x16 → i16x16 → i32x8 → round_float → f32x8`, split via `bytemuck::cast`). **Tried on `nibble_dot32`: bit-identical, but measured ~neutral on M5 (≤4%, within noise) → reverted.** The unpack isn't the dot's bottleneck (the fixed f32 FMA/load throughput is). May still pay off on x86/AVX2 (untested), where the scalar gather likely costs more. See notes. | moderate | **~0 on M5** (NEON); possibly positive on AVX2 |
 | **9l ✅ (prefill)** | **Multi-row register blocking** — `matmul`'s Q4_K path computes `Q4K_ROW_TILE = 4` output rows per pass (`dot_q4k_rowtile_q8_batch`), giving 4 independent dot chains for ILP and reusing each token's Q8 block across the tile; the per-row dot also defers the horizontal reduction (`wsd_q4k`: one `vaddvq`/block via a `vmlaq` accumulator, vs one per sub-block). Bit-identical. **Applied to batched prefill only** (decode `matvec` is still single-row). | moderate | **~4% on M5** on top of 9f's Q4_K path (the int8 dot, not the reduce, is the floor); decode unchanged |
 | **9m ✅** | **`#[inline(always)]` on hot kernel leaves** — force-inline the small private functions in the `matvec`/dequant inner loops so they fold into the per-block dot (`load8`, `nibble_dot32`, `nibble_idot32`, `q6_dot16`, `get_scale_min_k4`, and the single-call-site per-block dots `dot_q4k_block`/`dot_q6k_block`/`dot_q4k_block_q8`/`dot_q4k_row_q8`). See notes. | trivial | within noise (≈neutral–slightly positive on M5); output bit-identical |
+| **9n ✅** | **Q4_K AVX-512 VNNI (`vpdpbusd`)** — the x86 Q4_K int8 dot used to go through the `wide` path (`nibble_idot32`: `vpmovzxbw` widen i8→i16 + `vpmaddwd`), while Q6_K got VNNI in 9h. Q4_K is the *cleaner* fit: nibbles are unsigned 0..15 and activations signed i8 → `vpdpbusd` (u8×s8) directly, **no recenter/offset trick**, and the `min` term already uses the precomputed `sums`. Done: `q4k_block_sd_vnni` (decode `dot_q4k_block_q8`) + VNNI `wsd_q4k` (batch/prefill `dot_q4k_row_q8_batch` + tiled `dot_q4k_rowtile_q8_batch`), both `#[cfg(avx512vnni+bw+vl)]` mirroring `q6k_block_idot_vnni`; `q4k_block_sd_vnni_matches_portable` self-test, golden e2e preserved. Profiling (Zen 4, single-thread decode) showed Q4_K was **~64% of kernel time, ~4× Q6_K** — see notes. | moderate | **measured on Zen 4 (7950X)**: single-thread **decode +45%** (11.5→16.7), **prefill +29%** (23.5→30.4); all-core **prefill +8%** (117→127). Multi-core decode unchanged (bandwidth-bound, as predicted) |
+| **9o** | **Q6_K batch VNNI + row tiling (9l for Q6_K)** — the prefill batch path (`dot_q6k_row_q8_batch` → `wsd_q6k`) still uses `wide` (`vpmaddwd`), unlike the VNNI **decode** block (9h), and has **no** multi-row ILP kernel (Q4_K has `dot_q4k_rowtile_q8_batch`; Q6_K runs one row at a time). Give `wsd_q6k` a VNNI variant and add a `Q6K_ROW_TILE` micro-kernel. | moderate | x86 prefill |
+| **9p** | **Q6_K VNNI decode — drop per-row Σqx recompute** — `q6k_block_idot_vnni` recomputes the `−32` bias term `Σqx` per weight row via a 2nd `vpdpbusd(ones, qx)` + `vpmulld`, but `Σqx` depends only on the activations. Precompute 16-wide activation sub-block sums once per token (Q8Vec already carries 32-wide `sums` for Q4_K) and reduce the correction to one `vpmaddwd(sc16, subsum16)`/block — roughly halving the block's heavy ops. | easy | small; low-thread decode only (bandwidth-bound past ~4t) |
 
-Suggested order: **9a–9f + 9h + 9i + 9j + 9l + 9m done**. Next: **9g** for long contexts. Further
-fork/join trimming beyond 9i was tried (batching q/k/v + dense gate/up) and measured **neutral**,
-so it's deprioritized.
+Suggested order: **9a–9f + 9h + 9i + 9j + 9l + 9m + 9n done**. Next on **x86 (Zen 4)**: **9o**
+(Q6_K prefill VNNI + tiling), then **9p**. **9g** for long contexts.
+Further fork/join trimming beyond 9i was tried (batching q/k/v + dense gate/up) and measured
+**neutral**, so it's deprioritized.
 
 **Prefill perf vs llama.cpp (the gap).** Reference llama.cpp does ~500 tok/s prefill on this
 model/machine; bebelm batched prefill is now **~125 tok/s** (all cores), up from ~43 per-token.
@@ -474,12 +478,41 @@ levers, biggest first:
   and re-validating the golden prefix.
 - **Heterogeneous-core scheduling** — the 6 E-cores barely help; P-core-only affinity or
   size-weighted work splitting could recover some of the plateau.
-- **x86 validation** — the Q6_K AVX-512 VNNI `vpdpbusd` path (9h) is cross-compiled and unit-tested
-  for equivalence but **never run on x86 silicon** (dev machine is Apple Silicon; Rosetta SIGILLs on
-  AVX-512). Benchmark + golden-re-check it on the Zen 4 box; if the `vpdpbusd` byte dot underperforms
-  the portable `wide` path there, gate it off. The portable AVX2 path *is* validated (Rosetta).
+- **x86 validation** — the Q6_K AVX-512 VNNI `vpdpbusd` path (9h) now **runs on a Zen 4 box**
+  (Ryzen 7950X): selected via `target-cpu=native`, golden prefix preserved, decode correct. It is
+  *not* the decode bottleneck there (Q6_K ≈ 16% of decode, Q4_K ≈ 64% — see the 9n–9p note), so the
+  remaining x86 compute work is **9n** (Q4_K VNNI) and **9o** (Q6_K batch VNNI + tiling), both
+  prefill-weighted since multi-core decode is bandwidth-bound.
 
 ### Notes on selected sub-items
+
+**9n–9p — x86 (Zen 4 / Ryzen 7950X) profiling, June 2026.** First profiling run on real
+AVX-512 hardware (`perf record`, `target-cpu=native` → `avx512vnni+bw+vl` on, so the 9h Q6_K
+`vpdpbusd` path *is* selected). Method: lower `kernel.perf_event_paranoid` to 1, build release
+with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` (line tables only — no codegen change) so
+`perf`'s dwarf call-graph expands the inlined `.sum()`/`fold` frames. Findings:
+
+- **Inlining is healthy.** Hot samples land in `Iterator::fold`, but that's the *outermost
+  merged frame*: the dwarf inline stack expands it to `dot_q4k_row_q8 → sum → map_fold → fold`,
+  with the `vpdpbusd`/`vpmaddwd` math inlined directly into the `fold` body. No out-of-line hot
+  copies of the per-block dots. The `fold` symbol name is cosmetic, not a missed inline.
+- **Q4_K dominates decode, not Q6_K.** Single-thread decode kernel split: **Q4_K ≈ 64%** (the
+  `wide`/`vpmaddwd` path), **Q6_K ≈ 16%** (VNNI `vpdpbusd`), ~4:1 — this MoE runs 2 Q4_K
+  matrices (gate+up) per expert vs 1 Q6_K (down) plus the Q6_K logits head. The 9h commit
+  optimized the *smaller* of the two; the larger Q4_K dot never got VNNI (→ **9n**).
+- **Decode is memory-bandwidth-bound past ~4 threads.** Decode tok/s by thread count:
+  `1t→11.5, 4t→35.6, 8t→37.8, 16t→34.4` (plateaus at ~4t; 16t regresses). So SIMD/compute wins
+  speed up single/low-thread decode but **do not move steady-state multi-core decode** — it's
+  DRAM-limited streaming the weights. This is the real reason the 9h Q6_K VNNI win "felt small."
+- **Prefill is compute-bound and scales.** Prefill tok/s: `1t→23.5, 4t→68.7, 8t→99.6,
+  16t→121.5` (5.2× over 16t). Weight reuse across the batch hides memory, so the int8-dot
+  throughput *is* the floor — this is where 9n/9o land their gains. (Reference llama.cpp does
+  ~500 tok/s prefill here; bebelm ~121, so headroom remains.)
+
+Takeaway: rank x86 compute work by **prefill** payoff (9n ≫ 9o > 9p); none meaningfully raises
+multi-core *decode* throughput, which needs the bandwidth levers (smaller weights / 9g) instead.
+
+
 
 **9b — exact F32 tensors to precompute.** These were re-dequantized via `dequant_vec` on
 every `forward_step` (~101 small heap allocations + copies per token). Pre-dequantized once

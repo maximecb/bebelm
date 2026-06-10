@@ -223,18 +223,69 @@ fn dot_q4k_block_q8(block: &[u8], qx: &[i8], sx: f32, sums: &[i32]) -> f32 {
     let scales = &block[4..16];
     let qs = &block[16..144];
 
-    let mut sd = 0i32; // Σ_j sc_j · ⟨q_w, q_x⟩_j  (exact)
-    let mut sm = 0i32; // Σ_j m_j · Σ q_x_j         (exact)
+    // Unpack the 8 sub-block (scale, min) pairs once: `sc` feeds the weight·activation dot, `m`
+    // the `min` term. `sm = Σ_j m_j · Σ q_x_j` is the same scalar reduction on every target (the
+    // `Σ q_x_j` are precomputed in `sums`); only the `sd` weight·activation dot is arch-specific.
+    let mut sc = [0i32; 8];
+    let mut sm = 0i32; // Σ_j m_j · Σ q_x_j  (exact)
+    for j in 0..8 {
+        let (s, m) = dequant::get_scale_min_k4(j, scales);
+        sc[j] = s as i32;
+        sm += m as i32 * sums[j];
+    }
+    // AVX-512 VNNI byte dot where present (the x86 analogue of the NEON `sdot` path); otherwise the
+    // portable `nibble_idot32` (`wide` widen + `pmaddwd`). Both yield the identical exact integer `sd`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    let sd = q4k_block_sd_vnni(qs, &sc, qx);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl")))]
+    let sd = q4k_block_sd_portable(qs, &sc, qx);
+    sx * (d * sd as f32 - dmin * sm as f32)
+}
+
+/// Portable Q4_K block scaled dot `Σ_j sc_j·⟨nibble_j, qx_j⟩` (exact i32): sub-block `2c` is the
+/// low nibbles of `qs` chunk `c`, `2c+1` the high nibbles, each dotted against the matching 32
+/// activations via [`nibble_idot32`] (aarch64 `sdot`; elsewhere `wide` `pmaddwd`). The non-VNNI
+/// arm of [`dot_q4k_block_q8`]; also the VNNI path's test reference.
+#[allow(dead_code)] // dead on x86 VNNI builds (kept as ref/fallback); live on aarch64 + non-VNNI x86
+#[inline(always)]
+fn q4k_block_sd_portable(qs: &[u8], sc: &[i32], qx: &[i8]) -> i32 {
+    let mut sd = 0i32;
     for c in 0..4 {
         let q = &qs[c * 32..c * 32 + 32];
-        let (sc1, m1) = dequant::get_scale_min_k4(2 * c, scales);
-        let (sc2, m2) = dequant::get_scale_min_k4(2 * c + 1, scales);
         let lo = nibble_idot32(q, &qx[(2 * c) * 32..], false);
         let hi = nibble_idot32(q, &qx[(2 * c + 1) * 32..], true);
-        sd += sc1 as i32 * lo + sc2 as i32 * hi;
-        sm += m1 as i32 * sums[2 * c] + m2 as i32 * sums[2 * c + 1];
+        sd += sc[2 * c] * lo + sc[2 * c + 1] * hi;
     }
-    sx * (d * sd as f32 - dmin * sm as f32)
+    sd
+}
+
+/// AVX-512 VNNI Q4_K block scaled dot — the same exact `sd` as [`q4k_block_sd_portable`], via the
+/// byte-level `vpdpbusd`. Q4_K needs no offset trick (unlike Q6_K's [`q6k_block_idot_vnni`]): the
+/// nibbles are unsigned `0..15`, the activations signed i8, which is exactly `vpdpbusd`'s u8×s8.
+/// Each 32-wide sub-block is one `vpdpbusd` (8 i32 partials, all the same scale) plus one
+/// `vpmulld` by that sub-block's scale; the 8 scaled partials reduce once at the end.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+#[inline]
+fn q4k_block_sd_vnni(qs: &[u8], sc: &[i32], qx: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    // SAFETY: gated on avx512vnni+bw+vl, so every intrinsic is available. All 32-byte loads stay in
+    // bounds (`qs` is 128 B = 4×32; `qx` is 256 i8 = 8×32).
+    unsafe {
+        let mask_0f = _mm256_set1_epi8(0x0f);
+        let mut acc = _mm256_setzero_si256();
+        for c in 0..4 {
+            let qsv = _mm256_loadu_si256(qs.as_ptr().add(c * 32) as *const __m256i);
+            let lo = _mm256_and_si256(qsv, mask_0f); // sub-block 2c, q ∈ 0..15
+            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(qsv), mask_0f); // sub-block 2c+1
+            let x_lo = _mm256_loadu_si256(qx.as_ptr().add(2 * c * 32) as *const __m256i);
+            let x_hi = _mm256_loadu_si256(qx.as_ptr().add((2 * c + 1) * 32) as *const __m256i);
+            let d_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo, x_lo);
+            let d_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi, x_hi);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d_lo, _mm256_set1_epi32(sc[2 * c])));
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d_hi, _mm256_set1_epi32(sc[2 * c + 1])));
+        }
+        hsum_i32x8(acc)
+    }
 }
 
 /// Q8-activation integer dot of a whole Q4_K weight row against pre-quantized activations.
@@ -287,7 +338,30 @@ fn wsd_q4k(nib: &[i8], qx: &[i8], sc: &[i32]) -> i32 {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// AVX-512 VNNI variant of [`wsd_q4k`] for the batch/prefill path: each 32-wide sub-block of
+/// pre-unpacked nibbles (`nib` ∈ 0..15, stored as i8) is one `vpdpbusd` (u8×s8) against its 32
+/// activations, scaled by `sc[s]` and accumulated, reducing once at the end. Same exact integer as
+/// the `wide` path; the byte dot replaces its i8→i16 widen + `pmaddwd`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+#[inline(always)]
+fn wsd_q4k(nib: &[i8], qx: &[i8], sc: &[i32]) -> i32 {
+    use core::arch::x86_64::*;
+    // SAFETY: gated on avx512vnni+bw+vl. `nib`/`qx` are 256 i8 = 8×32, so all 32-byte loads are in
+    // bounds. `nib` holds values 0..15, read as u8 by `vpdpbusd`.
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..8 {
+            let w = _mm256_loadu_si256(nib.as_ptr().add(s * 32) as *const __m256i);
+            let x = _mm256_loadu_si256(qx.as_ptr().add(s * 32) as *const __m256i);
+            let d = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, x);
+            acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d, _mm256_set1_epi32(sc[s])));
+        }
+        hsum_i32x8(acc)
+    }
+}
+
+#[cfg(all(not(target_arch = "aarch64"), not(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))))]
 #[inline(always)]
 fn wsd_q4k(nib: &[i8], qx: &[i8], sc: &[i32]) -> i32 {
     use wide::{i16x16, i32x8, i8x16};
@@ -1376,6 +1450,37 @@ mod tests {
                 q6k_block_idot_portable(block, &q8.q[..256]),
                 "seed {seed}"
             );
+        }
+    }
+
+    /// The Q4_K AVX-512 VNNI block dot must equal the portable path bit-for-bit, and both must equal
+    /// the batch kernel `wsd_q4k` (active variant) fed the same block's unpacked nibbles — i.e. all
+    /// three Q4_K `sd` paths agree on the exact integer. Only built/run when VNNI is enabled.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    #[test]
+    fn q4k_block_sd_vnni_matches_portable() {
+        for seed in 0..4 {
+            let block = &q4k_matrix(1, seed * 5)[..144];
+            let x: Vec<f32> = (0..256).map(|i| ((i * 7 + seed) % 19) as f32 * 0.04 - 0.3).collect();
+            let q8 = quantize_q8(&x);
+            let qs = &block[16..144];
+            let scales = &block[4..16];
+            let mut sc = [0i32; 8];
+            for (j, s) in sc.iter_mut().enumerate() {
+                *s = dequant::get_scale_min_k4(j, scales).0 as i32;
+            }
+            let want = q4k_block_sd_portable(qs, &sc, &q8.q[..256]);
+            assert_eq!(q4k_block_sd_vnni(qs, &sc, &q8.q[..256]), want, "block sd, seed {seed}");
+
+            // Same block, unpacked to contiguous sub-block nibbles (the batch layout), via `wsd_q4k`.
+            let mut nib = [0i8; 256];
+            for c in 0..4 {
+                for (i, &byte) in qs[c * 32..c * 32 + 32].iter().enumerate() {
+                    nib[2 * c * 32 + i] = (byte & 0x0f) as i8;
+                    nib[(2 * c + 1) * 32 + i] = (byte >> 4) as i8;
+                }
+            }
+            assert_eq!(wsd_q4k(&nib, &q8.q[..256], &sc), want, "wsd_q4k, seed {seed}");
         }
     }
 
