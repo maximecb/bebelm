@@ -411,16 +411,18 @@ src/
    " the city of Paris" (fluent + factually correct), validating the whole pipeline.
 9. **Optimizations** (sub-items 9a–9l in the *Optimizations* section above; ordered
    easiest-first with impact estimates). Baseline already has MoE sparsity + caches;
-   **9a–9e + 9i (MoE expert batching) + 9j (AVX2 build) done** — now **~16 tok/s decode /
-   ~17–19 prefill** on the M5 MacBook Air (~18× over the 0.87 single-core baseline).
-   Profiling (`profile.sh`) shows decode is **compute-bound**: ~82% of samples sit in the
-   quantized dot kernels (Q4_K `nibble_dot32`/`dot_q4k_block`, Q6_K `dot_q6k_block`), ~18%
-   in fork/join idle, and only ~11% of the M5's 153 GB/s is used (~1.1 GB active weights/
-   token × ~16 tok/s ≈ 17 GB/s). So decode is compute-bound, but *not* on the unpack: the
-   **9k** experiment (vectorizing the K-quant unpack) was bit-identical yet ~neutral on M5,
-   so the dot kernels are bound by the fixed per-8-weight f32 FMA + load throughput, not the
-   sub-byte unpack. The real compute lever is therefore **9h** (integer dot). Remaining:
-   9h, plus 9f (long prompts) / 9g (long contexts); 9k/9l deprioritized on M5.
+   **9a–9f + 9h + 9i + 9j + 9l + 9m done** — now **~62 tok/s decode (~20 single-thread) /
+   ~125 prefill** on the M5 MacBook Air. Decode is **compute-bound** in the quantized dot
+   kernels. The Q4_K **and** Q6_K hot paths now both use the Q8-activation integer `sdot` (9h);
+   re-profiling single-thread decode (after the Q4_K int dot landed) showed **~90% of compute
+   was the remaining Q6_K f32 dot** (`fused_row_dot`/`dot_q6k_block` — the output/logits
+   projection + the MoE `ffn_down` experts), since Q6_K still dequantized to f32 while Q4_K had
+   moved to `sdot`. Converting Q6_K to the Q8 integer dot with a **fused, vectorized** 6-bit
+   unpack (`dot_q6k_block_q8`) gave **~2.7× single-thread / ~2× all-core decode** (7.2→19.6 /
+   31→62 tok/s), bit-identical prefill≡decode and golden-prefix preserved. NB: the integer dot
+   only wins when the unpack is *vectorized and fused* into the dot — an unpack-to-`[i8;256]`
+   buffer then sdot measured *slower* than the f32 path for single-row decode (no batch to
+   amortize the buffer round-trip). Remaining: 9g (long contexts); 9k deprioritized on M5.
   - llama.cpp has a custom GEMM (matrix multiply) and MoE routing kernels tuned for
     hybrid (convolution + attention) architecture. We could potentially take inspiration
     from this, but we should probably start by profiling our current kernels.
@@ -445,31 +447,37 @@ Ordered easiest → hardest, with rough impact. Effects are roughly **multiplica
 | **9c ✅** | **Multithread `matvec` over output rows (`rayon`)** — rows are independent (dequant row + dot). The single hot path (all projections, experts, logits). Serial fallback below 64 rows (router, k/v proj). | easy | **measured ~5.3× decode** (0.87→4.6 tok/s) + ~5–6× prefill on 10 cores (4P+6E); ids bit-identical |
 | **9d ✅** | **Cross-platform SIMD for dot + dequant MAC** — **`wide`** `f32x8` (= one 256-bit AVX2 reg; 2× 128-bit NEON on arm64). `wide` has no `f32x16` (that's AVX-512-only, absent here); for more throughput use multiple `f32x8` accumulators (ILP), not wider lanes. Favor `wide` over `std::arch`; `std::simd` is nightly. | moderate | **measured ~1.75× decode** from the SIMD `dot` alone (4.75→8.31 tok/s); **~2.8× decode / 4.0× prefill** total once fused with 9e (→13.4 / 15.2 tok/s on 10 cores); ids still bit-identical |
 | **9e ✅** | **Fuse dequant-and-dot in `matvec`** — accumulate per block instead of materializing a full dequantized row buffer (better cache locality). | moderate | **done as part of 9d**: Q4_K rows dequantize each 256-weight block straight into the `f32x8` dot via `Σ(d·q−min)·x = d·Σ(q·x)−min·Σx` (scale/min applied once per sub-block). **Q6_K rows now fused too** (`Σ w·x = d·Σ_sub sc·Σ(q−32)·x`): **+~12% decode / +8% prefill** on top (→14.98 / 16.4 tok/s) — smaller than its MAC share since the Q6_K fallback already used the SIMD `dot`, so only its dequant arithmetic + scratch traffic improved. Only the tiny F32 router still uses the dequant-then-dot path |
-| **9f ✅** | **Batched GEMM prefill** — `matmul` (token-major `Y=W·X`) applies each weight row to all prompt tokens at once; conv/attention reuse the per-token kernels over the cache prefix; MoE is **token-grouped** (each expert runs once over the tokens that picked it). Per dtype: Q4_K = blocked Q8 int dot (9l), Q6_K = unpack-once f32, F32 = dequant-once. Driven from `Agent::generate` in 512-token chunks, with a per-token fallback when the KV window would slide mid-prefill. **Bit-for-bit identical** to per-token prefill (`matmul_matches_per_token_matvec` + e2e `batched_prefill_matches_per_token`). | moderate | **measured ~2.1× prefill on M5** (43→90 tok/s, 1153-tok prompt). The big lever was **batching Q6_K**: profiling showed the per-token f32 `fused_row_dot` (the MoE `ffn_down_exps`) was ~75% of prefill because it re-ran the scalar 6-bit unpack per token; unpacking once per block → ~1.5× alone. |
+| **9f ✅** | **Batched GEMM prefill** — `matmul` (token-major `Y=W·X`) applies each weight row to all prompt tokens at once; conv/attention reuse the per-token kernels over the cache prefix; MoE is **token-grouped** (each expert runs once over the tokens that picked it). Per dtype: Q4_K = blocked Q8 int dot (9l), Q6_K = unpack-once Q8 int dot (9h), F32 = dequant-once. Driven from `Agent::generate` in 512-token chunks, with a per-token fallback when the KV window would slide mid-prefill. **Bit-for-bit identical** to per-token prefill (`matmul_matches_per_token_matvec` + e2e `batched_prefill_matches_per_token`). | moderate | **measured ~2.1× prefill on M5** (43→90 tok/s, 1153-tok prompt). The big lever was **batching Q6_K**: profiling showed the per-token f32 `fused_row_dot` (the MoE `ffn_down_exps`) was ~75% of prefill because it re-ran the scalar 6-bit unpack per token; unpacking once per block → ~1.5× alone. |
 | **9g** | **f16 KV cache** — store K/V as f16 to halve attention memory bandwidth. | easy–moderate | small now; grows with context length |
-| **9h** | **Q8 activation + integer block dot** (llama.cpp `vec_dot`) — *per-matmul*, quantize the **input vector** to Q8_K (activations stay f32 everywhere else) and dot in the integer domain directly against the Q4_K/Q6_K quants; no f32 weight dequant. Supersedes 9d/9e on the hot path. See notes. | hard | **HIGH ~2–4×**, most complex |
+| **9h ✅** | **Q8 activation + integer block dot** (llama.cpp `vec_dot`) — *per-matmul*, quantize the **input vector** to Q8 (activations stay f32 everywhere else) and dot in the integer domain directly against the K-quant weights with `sdot`; no f32 weight dequant. **Q4_K** (`dot_q4k_row_q8`/`wsd_q4k`/`nibble_idot32`) and **Q6_K** (`dot_q6k_block_q8`/`unpack_q6k_block`/`wsd_q6k`) both done, across decode (`matvec`/`matvec_fused_batch`) and prefill (`matmul`); bit-identical prefill≡decode, golden prefix preserved. Q6_K decode uses a **fused, vectorized** 6-bit unpack (NEON `vshl`/`vand`/`vorr`→`sdot`); the batch path unpacks once per block and reuses across tokens. **x86**: the Q6_K block dot (`dot_q6k_block_q8`) has a portable `wide` fused-unpack path (`i16x16` lane ops → `pmaddwd`, no scratch — validated on real AVX2 under Rosetta) and an **AVX-512 VNNI** path (`q6k_block_idot_vnni`: byte `vpdpbusd`, the x86 analogue of `sdot`; keeps `q∈0..63` and corrects the `−32` offset via `Σq·qx − 32·Σqx`). VNNI is compile-gated (`avx512vnni+bw+vl`, on with `target-cpu=native` on Zen 4 / Ice Lake+); cross-compiled + a gated self-test asserts it equals the portable path — **not yet benchmarked on x86 hardware**. | hard | **measured ~2.7× single-thread / ~2× all-core decode** on M5 (Q6_K step: 7.2→19.6 / 31→62 tok/s); also lifts prefill. x86 unmeasured |
 | **9i ✅** | **Batch MoE expert matvecs** — run all selected experts' gate+up rows (then all down rows) as one parallel region (`matvec_fused_batch`) instead of 12 separate fork/joins per MoE layer. | easy | **measured ~+18% decode** (13.7→~16 tok/s); fewer fork/join barriers → better core saturation |
 | **9j ✅** | **AVX2 + FMA on x86** — `.cargo/config.toml` sets `target-cpu=native`; the default x86_64 baseline is SSE2-only, so `wide`'s `f32x8` ran at half width. Scoped to x86_64 (arm64/NEON untouched). | trivial | x86 target only (not yet measured on the i5); arm64 unchanged |
 | **9k ⚠️** | **Vectorize the K-quant unpack** — replace the per-lane scalar gather in `nibble_dot32` with in-vector `wide` widening (`u8x16 → i16x16 → i32x8 → round_float → f32x8`, split via `bytemuck::cast`). **Tried on `nibble_dot32`: bit-identical, but measured ~neutral on M5 (≤4%, within noise) → reverted.** The unpack isn't the dot's bottleneck (the fixed f32 FMA/load throughput is). May still pay off on x86/AVX2 (untested), where the scalar gather likely costs more. See notes. | moderate | **~0 on M5** (NEON); possibly positive on AVX2 |
 | **9l ✅ (prefill)** | **Multi-row register blocking** — `matmul`'s Q4_K path computes `Q4K_ROW_TILE = 4` output rows per pass (`dot_q4k_rowtile_q8_batch`), giving 4 independent dot chains for ILP and reusing each token's Q8 block across the tile; the per-row dot also defers the horizontal reduction (`wsd_q4k`: one `vaddvq`/block via a `vmlaq` accumulator, vs one per sub-block). Bit-identical. **Applied to batched prefill only** (decode `matvec` is still single-row). | moderate | **~4% on M5** on top of 9f's Q4_K path (the int8 dot, not the reduce, is the floor); decode unchanged |
 | **9m ✅** | **`#[inline(always)]` on hot kernel leaves** — force-inline the small private functions in the `matvec`/dequant inner loops so they fold into the per-block dot (`load8`, `nibble_dot32`, `nibble_idot32`, `q6_dot16`, `get_scale_min_k4`, and the single-call-site per-block dots `dot_q4k_block`/`dot_q6k_block`/`dot_q4k_block_q8`/`dot_q4k_row_q8`). See notes. | trivial | within noise (≈neutral–slightly positive on M5); output bit-identical |
 
-Suggested order: **9a–9f + 9i + 9j + 9l(prefill) + 9m done**. Next: **9h** (int8 Q6_K dot — now
-the top prefill lever, see note), **9g** for long contexts. Further fork/join trimming beyond 9i
-was tried (batching q/k/v + dense gate/up) and measured **neutral**, so it's deprioritized.
+Suggested order: **9a–9f + 9h + 9i + 9j + 9l + 9m done**. Next: **9g** for long contexts. Further
+fork/join trimming beyond 9i was tried (batching q/k/v + dense gate/up) and measured **neutral**,
+so it's deprioritized.
 
 **Prefill perf vs llama.cpp (the gap).** Reference llama.cpp does ~500 tok/s prefill on this
-model/machine; bebelm batched prefill is now **~90 tok/s** (1153-tok prompt, all cores), up from
-~43 per-token. Thread scaling is ~2.6× at 4 P-cores, ~3.3× at 10 (the 6 E-cores add ~27% — weak
-for int8 GEMM), so per-core kernel efficiency still dominates the remaining gap. Done so far: 9f
-(batch) + 9l (Q4_K block/ILP) + Q6_K unpack-once. Remaining levers, biggest first:
-- **Int8 Q6_K dot (9h)** — Q6_K (the MoE `ffn_down_exps`) is now the largest slice: it batches the
-  unpack but still dots in **f32** (~¼ the density of the Q4_K `sdot`). Recentering `q−32` to i8
-  and using `sdot` (as llama.cpp's `vec_dot_q6_K_q8_K` does) would lift it. **Caveat:** this
-  quantizes the Q6_K matmul's *activations* to Q8 — a numerics change — so it must also replace the
-  decode Q6_K path to keep prefill≡decode, and re-validate the golden prefix.
+model/machine; bebelm batched prefill is now **~125 tok/s** (all cores), up from ~43 per-token.
+Per-core kernel efficiency (plus weak E-core scaling for int8 GEMM) still dominates the remaining
+gap. Done so far: 9f (batch) + 9l (Q4_K block/ILP) + 9h (Q4_K **and** Q6_K int8 `sdot`). Remaining
+levers, biggest first:
+- **Q6_K register/ILP blocking (9l for Q6_K)** — Q6_K now uses the `sdot` integer dot (9h) but, in
+  the batch path, a single-row kernel; multi-row tiling like `dot_q4k_rowtile_q8_batch` would add
+  independent dot chains for ILP. (Historic note: before 9h, Q6_K batched the unpack but still
+  dotted in **f32** at ~¼ the density of the Q4_K `sdot`; 9h closed that gap.) The earlier caveat
+  — that quantizing the Q6_K matmul's *activations* to Q8 is a numerics change — was handled by
+  converting the decode **and** prefill Q6_K paths together (so prefill≡decode stays bit-identical)
+  and re-validating the golden prefix.
 - **Heterogeneous-core scheduling** — the 6 E-cores barely help; P-core-only affinity or
   size-weighted work splitting could recover some of the plateau.
+- **x86 validation** — the Q6_K AVX-512 VNNI `vpdpbusd` path (9h) is cross-compiled and unit-tested
+  for equivalence but **never run on x86 silicon** (dev machine is Apple Silicon; Rosetta SIGILLs on
+  AVX-512). Benchmark + golden-re-check it on the Zen 4 box; if the `vpdpbusd` byte dot underperforms
+  the portable `wide` path there, gate it off. The portable AVX2 path *is* validated (Rosetta).
 
 ### Notes on selected sub-items
 

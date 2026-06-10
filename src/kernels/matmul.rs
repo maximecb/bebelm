@@ -404,53 +404,294 @@ fn dot_q6k_block(block: &[u8], x: &[f32]) -> f32 {
     d * acc
 }
 
-/// Batched Q6_K matmul of one weight row against **all** `n_tokens` token-major columns of `x`
-/// (token `t`'s block `b` is `x[t*n_in + b*256..]`), accumulating into `out[t]`. Each 256-weight
-/// block is unpacked **once** to its `(q−32)` f32 values (in [`dot_q6k_block`]'s sub-block order,
-/// so each 16-wide sub-block lines up with a contiguous 16-wide `x` slice) and then dotted against
-/// every token — hoisting Q6_K's costly per-element 6-bit unpack out of the per-token loop, which
-/// is the bulk of the f32 fused path's cost. Reuses [`dot`] for the 16-wide sub-block dot, whose
-/// reduction matches [`q6_dot16`] exactly, so the result is **bit-for-bit** equal to
-/// [`fused_row_dot`] per token. `out` must be pre-zeroed; its length is the token count.
-fn dot_q6k_row_batch(row: &[u8], x: &[f32], n_in: usize, out: &mut [f32]) {
-    // Same group layout as `dot_q6k_block`: (ql byte offset in the half, high nibble?, qh shift).
-    const GROUPS: [(usize, bool, u32); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];
-    for (b, block) in row.chunks_exact(210).enumerate() {
-        let d = dequant::f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
-        let ql_all = &block[0..128];
-        let qh_all = &block[128..192];
-        let sc_all = &block[192..208];
+// --- Q6_K Q8-activation integer dot (opt 9h, Q6_K) ---
+//
+// The Q6_K mirror of the Q4_K Q8 path above: quantize the activations to Q8 once per matmul,
+// recenter each 6-bit weight to int8 (`q − 32`, landing in −32..31), and dot in the integer
+// domain with `sdot`. This replaces the scalar-unpack-to-f32 + f32 FMA of [`dot_q6k_block`],
+// which was the single biggest decode cost (Q6_K = the output/logits projection + the MoE
+// `ffn_down` experts). Activations stay f32 everywhere else; only their Q8 rounding adds error
+// (the integer dot itself is exact), matching ggml's Q6_K×Q8_K accuracy.
 
-        // Unpack the block's 16 sub-blocks (16 weights each) once: qf = (q−32) as f32, sc = scale.
-        let mut qf = [0.0f32; 256];
-        let mut sc = [0.0f32; 16];
-        let mut k = 0;
+/// Unpack one 210-byte Q6_K block into 256 recentered (`q − 32`) int8 weights in output
+/// (sub-block) order plus the 16 int8 sub-block scales widened to `i32`. The byte layout and
+/// unpack order match [`dequant::dequantize_q6_k_block`] exactly (same group/sub-block walk as
+/// the f32 [`dot_q6k_block`]), so `wq[i]`/`sc[i/16]` line up index-for-index with output weight
+/// `i` (and hence with the matching Q8 activation).
+#[inline(always)]
+fn unpack_q6k_block(block: &[u8]) -> ([i8; 256], [i32; 16]) {
+    // (ql byte offset within the half, take ql's high nibble?, qh bit shift) per group.
+    const GROUPS: [(usize, bool, u32); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let sc_all = &block[192..208]; // i8 scales as raw bytes
+
+    let mut wq = [0i8; 256];
+    let mut sc = [0i32; 16];
+    let mut k = 0; // running 16-weight sub-block index (0..16)
+    for n in 0..2 {
+        let ql = &ql_all[n * 64..n * 64 + 64];
+        let qh = &qh_all[n * 32..n * 32 + 32];
+        let scn = &sc_all[n * 8..n * 8 + 8];
+        for (g, &(ql_off, high, shift)) in GROUPS.iter().enumerate() {
+            for sub in 0..2 {
+                sc[k] = scn[2 * g + sub] as i8 as i32;
+                let l_start = sub * 16;
+                for (i, w) in wq[k * 16..k * 16 + 16].iter_mut().enumerate() {
+                    let li = l_start + i;
+                    let low = if high { (ql[ql_off + li] >> 4) as i32 } else { (ql[ql_off + li] & 0x0f) as i32 };
+                    let hi = ((qh[li] >> shift) & 3) as i32;
+                    *w = ((low | (hi << 4)) - 32) as i8;
+                }
+                k += 1;
+            }
+        }
+    }
+    (wq, sc)
+}
+
+/// Weighted sub-block integer dot of one unpacked Q6_K block: `Σ_{s=0..16} sc[s]·⟨wq_s, qx_s⟩`,
+/// where `wq`/`qx` are 256 int8 weights/activations in 16 contiguous 16-wide sub-blocks and `sc`
+/// the 16 sub-block scales. Like [`wsd_q4k`], the per-sub-block dot accumulates into a **vector**
+/// accumulator scaled by `sc[s]` (one `vmlaq`/lane-multiply) and the horizontal reduction runs
+/// **once** at the end. The total is an exact integer, so the value is independent of the lane
+/// reduction order. aarch64 emits `sdot`; elsewhere `wide` widens to i16 and uses `i16x16::dot`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn wsd_q6k(wq: &[i8], qx: &[i8], sc: &[i32]) -> i32 {
+    use core::arch::aarch64::*;
+    use core::arch::asm;
+    // SAFETY: aarch64 implies NEON + `dotprod` (Apple Silicon default), so `sdot` is valid; see
+    // `nibble_idot32`. The intrinsic is still nightly-gated, so emit `sdot` via stable inline asm.
+    unsafe {
+        let mut vacc = vdupq_n_s32(0);
+        // `s` indexes both the slice and the load pointers, so enumerate doesn't fit.
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..16 {
+            let w = vld1q_s8(wq.as_ptr().add(s * 16));
+            let x = vld1q_s8(qx.as_ptr().add(s * 16));
+            let mut t = vdupq_n_s32(0);
+            asm!(
+                "sdot {t:v}.4s, {w:v}.16b, {x:v}.16b",
+                t = inout(vreg) t, w = in(vreg) w, x = in(vreg) x,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            vacc = vmlaq_s32(vacc, t, vdupq_n_s32(sc[s]));
+        }
+        vaddvq_s32(vacc)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn wsd_q6k(wq: &[i8], qx: &[i8], sc: &[i32]) -> i32 {
+    use wide::{i16x16, i32x8, i8x16};
+    let mut acc = i32x8::new([0; 8]);
+    #[allow(clippy::needless_range_loop)]
+    for s in 0..16 {
+        let av: [i8; 16] = wq[s * 16..s * 16 + 16].try_into().unwrap();
+        let bv: [i8; 16] = qx[s * 16..s * 16 + 16].try_into().unwrap();
+        let sub = i16x16::from(i8x16::new(av)).dot(i16x16::from(i8x16::new(bv)));
+        acc = acc + sub * i32x8::splat(sc[s]);
+    }
+    acc.reduce_add()
+}
+
+/// Q8-activation integer dot of one 210-byte Q6_K block against pre-quantized activations
+/// (`qx` = 256 int8, `sx` = block scale): `Σ w·x = sx · d · Σ_s sc_s·⟨wq_s, qx_s⟩`. The
+/// `⟨·,·⟩` are exact integer dots; only the activations carry Q8 rounding error.
+///
+/// aarch64 **fuses** the 6-bit unpack into the dot: each 16-weight sub-block is unpacked into a
+/// NEON register with vector ops and `sdot`'d immediately — no `[i8; 256]` scratch and no second
+/// pass (the unpack-to-buffer of [`unpack_q6k_block`] only pays off when amortized across a batch,
+/// as in [`dot_q6k_row_q8_batch`]; for single-row decode it's pure overhead). Other targets fall
+/// back to that buffered unpack. Both compute the identical exact integer `s`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn dot_q6k_block_q8(block: &[u8], qx: &[i8], sx: f32) -> f32 {
+    use core::arch::aarch64::*;
+    use core::arch::asm;
+    // Per group: (ql byte offset within the half, take ql's high nibble?, qh right-shift).
+    const GROUPS: [(usize, bool, i8); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];
+    let d = dequant::f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let sc_all = &block[192..208]; // i8 scales as raw bytes
+    // SAFETY: aarch64 implies NEON + `dotprod` (Apple Silicon default). All 16-byte loads stay in
+    // bounds (block is 210 B; `qx` is 256 i8). `sdot` is emitted via stable inline asm since the
+    // intrinsic is still nightly-gated; the unpack uses stable NEON intrinsics.
+    unsafe {
+        let lo_nib = vdupq_n_u8(0x0f);
+        let lo_2 = vdupq_n_u8(0x03);
+        let bias = vdupq_n_s8(32);
+        let mut vacc = vdupq_n_s32(0);
         for n in 0..2 {
-            let ql = &ql_all[n * 64..n * 64 + 64];
-            let qh = &qh_all[n * 32..n * 32 + 32];
-            let scn = &sc_all[n * 8..n * 8 + 8];
+            let qlh = ql_all.as_ptr().add(n * 64);
+            let qhh = qh_all.as_ptr().add(n * 32);
+            let sch = sc_all.as_ptr().add(n * 8);
             for (g, &(ql_off, high, shift)) in GROUPS.iter().enumerate() {
+                let neg = vdupq_n_s8(-shift); // `vshlq_u8` by a negative count = right shift
                 for sub in 0..2 {
-                    sc[k] = scn[2 * g + sub] as i8 as f32;
-                    let l_start = sub * 16;
-                    for (i, qfi) in qf[k * 16..k * 16 + 16].iter_mut().enumerate() {
-                        let li = l_start + i;
-                        let low = if high { (ql[ql_off + li] >> 4) as i32 } else { (ql[ql_off + li] & 0x0f) as i32 };
-                        let hi = ((qh[li] >> shift) & 3) as i32;
-                        *qfi = ((low | (hi << 4)) - 32) as f32;
-                    }
-                    k += 1;
+                    let k = n * 8 + 2 * g + sub; // output sub-block index (0..16)
+                    let qlv = vld1q_u8(qlh.add(ql_off + sub * 16));
+                    let qhv = vld1q_u8(qhh.add(sub * 16));
+                    let nib = if high { vshrq_n_u8::<4>(qlv) } else { vandq_u8(qlv, lo_nib) };
+                    let hi = vandq_u8(vshlq_u8(qhv, neg), lo_2);
+                    let q = vorrq_u8(nib, vshlq_n_u8::<4>(hi)); // (low | hi<<4) ∈ 0..63
+                    let w = vsubq_s8(vreinterpretq_s8_u8(q), bias); // (q − 32) ∈ −32..31
+                    let xv = vld1q_s8(qx.as_ptr().add(k * 16));
+                    let mut t = vdupq_n_s32(0);
+                    asm!(
+                        "sdot {t:v}.4s, {w:v}.16b, {x:v}.16b",
+                        t = inout(vreg) t, w = in(vreg) w, x = in(vreg) xv,
+                        options(pure, nomem, nostack, preserves_flags),
+                    );
+                    vacc = vmlaq_s32(vacc, t, vdupq_n_s32(*sch.add(2 * g + sub) as i8 as i32));
                 }
             }
         }
+        sx * (d * (vaddvq_s32(vacc) as f32))
+    }
+}
 
-        for (t, o) in out.iter_mut().enumerate() {
-            let xt = &x[t * n_in + b * 256..t * n_in + b * 256 + 256];
-            let mut acc = 0.0f32;
-            for kk in 0..16 {
-                acc += sc[kk] * dot(&qf[kk * 16..kk * 16 + 16], &xt[kk * 16..kk * 16 + 16]);
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn dot_q6k_block_q8(block: &[u8], qx: &[i8], sx: f32) -> f32 {
+    let d = dequant::f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+    // AVX-512 VNNI byte dot where present (the x86 analogue of the NEON `sdot` path); otherwise the
+    // portable `wide` fused unpack. Both yield the identical exact integer `s`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    let s = q6k_block_idot_vnni(block, qx);
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl")))]
+    let s = q6k_block_idot_portable(block, qx);
+    sx * (d * (s as f32))
+}
+
+/// Portable (`wide`) fused Q6_K block integer dot: `Σ_k sc[k]·Σ_{i∈k}(q_i − 32)·qx_i` (exact i32).
+/// Each 16-weight sub-block is unpacked straight into the dot with lane-wise `i16x16` ops (no
+/// `[i8; 256]` scratch, no scalar per-lane gather) — the non-aarch64 analogue of the NEON
+/// `dot_q6k_block_q8`. Compiled on every target so it can be unit-tested directly and reused as
+/// the VNNI path's reference; used in production on non-aarch64 builds without AVX-512 VNNI.
+#[allow(dead_code)] // unused on aarch64 (NEON path) and on x86 VNNI builds; kept for both as ref/fallback
+fn q6k_block_idot_portable(block: &[u8], qx: &[i8]) -> i32 {
+    use wide::{i16x16, i32x8, i8x16, u8x16};
+    const MASK_0F: i16x16 = i16x16::new([0x0f; 16]);
+    const MASK_03: i16x16 = i16x16::new([0x03; 16]);
+    const BIAS_32: i16x16 = i16x16::new([32; 16]);
+    // Per group: (ql byte offset within the half, take ql's high nibble?, qh right-shift).
+    const GROUPS: [(usize, bool, i32); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let sc_all = &block[192..208]; // i8 scales as raw bytes
+    let mut acc = i32x8::new([0; 8]);
+    for n in 0..2 {
+        let ql = &ql_all[n * 64..n * 64 + 64];
+        let qh = &qh_all[n * 32..n * 32 + 32];
+        let scn = &sc_all[n * 8..n * 8 + 8];
+        for (g, &(ql_off, high, shift)) in GROUPS.iter().enumerate() {
+            for sub in 0..2 {
+                let k = n * 8 + 2 * g + sub; // output sub-block index (0..16)
+                let qlb: [u8; 16] = ql[ql_off + sub * 16..ql_off + sub * 16 + 16].try_into().unwrap();
+                let qhb: [u8; 16] = qh[sub * 16..sub * 16 + 16].try_into().unwrap();
+                let qlv = i16x16::from(u8x16::new(qlb));
+                let qhv = i16x16::from(u8x16::new(qhb));
+                let nib = if high { (qlv >> 4_i32) & MASK_0F } else { qlv & MASK_0F };
+                let hi = (qhv >> shift) & MASK_03;
+                let w: i16x16 = (nib | (hi << 4_i32)) - BIAS_32; // (q − 32) per lane
+                let xb: [i8; 16] = qx[k * 16..k * 16 + 16].try_into().unwrap();
+                let xv = i16x16::from(i8x16::new(xb));
+                acc += w.dot(xv) * i32x8::splat(scn[2 * g + sub] as i8 as i32);
             }
-            *o += d * acc;
+        }
+    }
+    acc.reduce_add()
+}
+
+/// Horizontal sum of the eight `i32` lanes of an `__m256i`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+#[inline(always)]
+unsafe fn hsum_i32x8(v: core::arch::x86_64::__m256i) -> i32 {
+    let arr: [i32; 8] = core::mem::transmute(v);
+    arr.iter().sum()
+}
+
+/// AVX-512 VNNI fused Q6_K block integer dot — the same exact `s` as [`q6k_block_idot_portable`],
+/// via the byte-level `vpdpbusd`. That instruction is unsigned×signed, so it keeps the raw 6-bit
+/// quants `q ∈ 0..63` (not `q − 32`) and corrects the offset analytically:
+/// `Σ(q−32)·qx = Σ q·qx − 32·Σ qx`. It accumulates `Σ_k sc[k]·Σ q·qx` and `Σ_k sc[k]·Σ qx` into two
+/// vector accumulators (`sc` applied per 4-lane sub-block group) and combines once at the end. Each
+/// `vpdpbusd` consumes two 16-wide sub-blocks (32 bytes) at once; the 6-bit unpack is vectorized
+/// (`srlv`/`and`/`or` over 32 bytes). Bit-for-bit equal to the portable path (exact integer).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+#[inline]
+fn q6k_block_idot_vnni(block: &[u8], qx: &[i8]) -> i32 {
+    use core::arch::x86_64::*;
+    // Per group: (ql byte offset in the half, take ql's high nibble?, qh right-shift).
+    const GROUPS: [(usize, bool, i32); 4] = [(0, false, 0), (32, false, 2), (0, true, 4), (32, true, 6)];
+    let ql_all = &block[0..128];
+    let qh_all = &block[128..192];
+    let sc_all = &block[192..208];
+    // SAFETY: gated on avx512vnni+avx512bw+avx512vl, so every intrinsic below is available. All
+    // 32-byte loads stay in bounds (block is 210 B; `qx` is 256 i8 = 256 B).
+    unsafe {
+        let mask_0f = _mm256_set1_epi8(0x0f);
+        let mask_03 = _mm256_set1_epi8(0x03);
+        let ones = _mm256_set1_epi8(1);
+        let mut acc_sd = _mm256_setzero_si256(); // Σ sc·(Σ q·qx) partials, 4-lane-per-sub-block
+        let mut acc_sm = _mm256_setzero_si256(); // Σ sc·(Σ qx)   partials
+        for n in 0..2 {
+            let ql = ql_all.as_ptr().add(n * 64);
+            let qh = qh_all.as_ptr().add(n * 32);
+            let sc = sc_all.as_ptr().add(n * 8);
+            for (g, &(ql_off, high, shift)) in GROUPS.iter().enumerate() {
+                // Unpack 32 unsigned q ∈ 0..63 for sub-blocks (2g, 2g+1) of this half.
+                let qlv = _mm256_loadu_si256(ql.add(ql_off) as *const __m256i);
+                let qhv = _mm256_loadu_si256(qh as *const __m256i);
+                let nib = if high {
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(qlv), mask_0f)
+                } else {
+                    _mm256_and_si256(qlv, mask_0f)
+                };
+                let hi = _mm256_and_si256(_mm256_srlv_epi16(qhv, _mm256_set1_epi16(shift as i16)), mask_03);
+                let qv = _mm256_or_si256(nib, _mm256_slli_epi16::<4>(hi)); // q ∈ 0..63
+                let xv = _mm256_loadu_si256(qx.as_ptr().add(n * 128 + g * 32) as *const __m256i);
+                // dp lanes 0–3 = A_{2g} partials, 4–7 = A_{2g+1}; likewise Σqx for `b`.
+                let a = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qv, xv);
+                let b = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones, xv);
+                let s0 = *sc.add(2 * g) as i8 as i32;
+                let s1 = *sc.add(2 * g + 1) as i8 as i32;
+                let scv = _mm256_set_epi32(s1, s1, s1, s1, s0, s0, s0, s0); // lanes 0–3=s0, 4–7=s1
+                acc_sd = _mm256_add_epi32(acc_sd, _mm256_mullo_epi32(a, scv));
+                acc_sm = _mm256_add_epi32(acc_sm, _mm256_mullo_epi32(b, scv));
+            }
+        }
+        hsum_i32x8(acc_sd) - 32 * hsum_i32x8(acc_sm)
+    }
+}
+
+/// Q8-activation integer dot of a whole Q6_K weight row against pre-quantized activations.
+#[inline(always)]
+fn dot_q6k_row_q8(row: &[u8], a: &Q8Vec) -> f32 {
+    row.chunks_exact(210)
+        .enumerate()
+        .map(|(b, blk)| dot_q6k_block_q8(blk, &a.q[b * 256..b * 256 + 256], a.scales[b]))
+        .sum()
+}
+
+/// Batched Q8-activation integer dot of one Q6_K weight row against **all** `q8s` token columns,
+/// accumulating into `out[t]`. Each block is unpacked to int8 **once** and then dotted against
+/// every token — amortizing the 6-bit unpack over the batch (the prefill GEMM win). The
+/// per-(row, token) arithmetic is identical to [`dot_q6k_row_q8`] (exact integer dot, same i32
+/// accumulation, same `sx·(d·s)` f32 scaling, same block order), so the output is **bit-for-bit**
+/// equal to calling it per token. `out` must be pre-zeroed, length `q8s.len()`.
+fn dot_q6k_row_q8_batch(row: &[u8], q8s: &[Q8Vec], out: &mut [f32]) {
+    for (b, block) in row.chunks_exact(210).enumerate() {
+        let d = dequant::f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let (wq, sc) = unpack_q6k_block(block);
+        for (q8, o) in q8s.iter().zip(out.iter_mut()) {
+            let qx = &q8.q[b * 256..b * 256 + 256];
+            let s = wsd_q6k(&wq, qx, &sc);
+            *o += q8.scales[b] * (d * (s as f32));
         }
     }
 }
@@ -542,19 +783,17 @@ pub fn matvec(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], y
     assert_eq!(n_in % blk_elems, 0, "matvec: n_in ({n_in}) not a multiple of block ({blk_elems})");
     let row_bytes = (n_in / blk_elems) * blk_bytes as usize;
 
-    // One output row. The K-quants (Q4_K/Q6_K — the bulk of the weights) are fused: each
-    // 256-weight block dequantizes straight into the dot, so they need no scratch. Other
-    // dtypes (F32/F16 — e.g. the MoE router) dequantize the whole row into `scratch`, then dot.
+    // One output row. The K-quants (Q4_K/Q6_K — the bulk of the weights) take the Q8-activation
+    // integer dot: quantize x to Q8 once, then dot it (read-only, shared across rows) against
+    // every weight row in the integer domain — no f32 weight dequant, no scratch. Other dtypes
+    // (F32/F16 — e.g. the MoE router) dequantize the whole row into `scratch`, then dot.
     let fused = matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K);
-    // Q4_K uses the Q8-activation integer dot: quantize x once, then dot it (read-only,
-    // shared across rows) against every weight row. Q6_K keeps the f32 fused dot for now;
-    // other dtypes dequantize a row into `scratch` then dot.
-    let q8 = (dtype == GgmlType::Q4_K).then(|| quantize_q8(x));
+    let q8 = fused.then(|| quantize_q8(x));
     let compute_row = |o: usize, scratch: &mut [f32]| -> f32 {
         let row = &w[o * row_bytes..(o + 1) * row_bytes];
         match dtype {
             GgmlType::Q4_K => dot_q4k_row_q8(row, q8.as_ref().unwrap()),
-            GgmlType::Q6_K => fused_row_dot(dtype, row, x),
+            GgmlType::Q6_K => dot_q6k_row_q8(row, q8.as_ref().unwrap()),
             _ => {
                 dequant::dequantize_into(dtype, row, scratch);
                 dot(scratch, x)
@@ -638,28 +877,32 @@ pub fn matmul(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, x: &[f32], n
         } else {
             out_fm.chunks_mut(Q4K_ROW_TILE * n_tokens).enumerate().for_each(|(ti, chunk)| fill_tile(ti, chunk));
         }
+    } else if dtype == GgmlType::Q6_K {
+        // Q6_K mirrors Q4_K: quantize each token column to Q8 once (shared across weight rows),
+        // then dot each row against all columns, unpacking the row's blocks to int8 once per row.
+        let q8: Vec<Q8Vec> = (0..n_tokens).map(|t| quantize_q8(col(t))).collect();
+        let fill_row = |o: usize, dst: &mut [f32]| dot_q6k_row_q8_batch(&w[o * row_bytes..(o + 1) * row_bytes], &q8, dst);
+        if parallel {
+            out_fm.par_chunks_mut(n_tokens).enumerate().for_each(|(o, dst)| fill_row(o, dst));
+        } else {
+            out_fm.chunks_mut(n_tokens).enumerate().for_each(|(o, dst)| fill_row(o, dst));
+        }
     } else {
-        // One weight row dotted against all token columns. Q6_K unpacks each block to f32 once and
-        // reuses it across tokens; F32/F16 dequantize the row into `scratch` once, then dot.
-        let scratch_len = if dtype == GgmlType::Q6_K { 0 } else { n_in };
+        // F32/F16: dequantize the row into `scratch` once, then dot against each token column.
         let compute_row = |o: usize, dst: &mut [f32], scratch: &mut [f32]| {
             let row = &w[o * row_bytes..(o + 1) * row_bytes];
-            if dtype == GgmlType::Q6_K {
-                dot_q6k_row_batch(row, x, n_in, dst);
-            } else {
-                dequant::dequantize_into(dtype, row, scratch);
-                for (t, d) in dst.iter_mut().enumerate() {
-                    *d = dot(scratch, col(t));
-                }
+            dequant::dequantize_into(dtype, row, scratch);
+            for (t, d) in dst.iter_mut().enumerate() {
+                *d = dot(scratch, col(t));
             }
         };
         if parallel {
             out_fm.par_chunks_mut(n_tokens).enumerate().for_each_init(
-                || vec![0.0f32; scratch_len],
+                || vec![0.0f32; n_in],
                 |scratch, (o, dst)| compute_row(o, dst, scratch),
             );
         } else {
-            let mut scratch = vec![0.0f32; scratch_len];
+            let mut scratch = vec![0.0f32; n_in];
             for (o, dst) in out_fm.chunks_mut(n_tokens).enumerate() {
                 compute_row(o, dst, &mut scratch);
             }
@@ -682,8 +925,8 @@ pub struct FusedJob<'a> {
     pub n_out: usize,
     pub x: &'a [f32],
     /// `x` pre-quantized via [`quantize_q8`] (so several jobs sharing one `x` quantize it once).
-    /// When `Some` — only valid for Q4_K — rows take the Q8-activation integer dot; `None` rows
-    /// take the f32 fused dot over `x`. Must be the quantization of *this* job's `x`.
+    /// When `Some` — valid for Q4_K and Q6_K — rows take the Q8-activation integer dot; `None`
+    /// rows take the f32 fused dot over `x`. Must be the quantization of *this* job's `x`.
     pub qx: Option<&'a Q8Vec>,
 }
 
@@ -692,9 +935,9 @@ pub struct FusedJob<'a> {
 /// must be `Σ n_out` long, jobs in order). Pooling the rows lets a few small matrices — e.g.
 /// the handful of selected MoE experts — saturate every core under one fork/join, instead of
 /// underutilizing it (and paying a join) one small matvec at a time. Each row uses the same
-/// per-row kernel a standalone call would: Q4_K jobs carrying a pre-quantized [`qx`](FusedJob::qx)
-/// take the Q8-activation integer dot, all others the f32 fused dot — so the batch is identical
-/// to running the jobs separately.
+/// per-row kernel a standalone call would: Q4_K/Q6_K jobs carrying a pre-quantized
+/// [`qx`](FusedJob::qx) take the Q8-activation integer dot, all others the f32 fused dot — so the
+/// batch is identical to running the jobs separately.
 pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
     // Per job: its row stride in bytes, and the first `out` row it owns (a prefix sum of
     // n_out). `starts` is ascending, so a row's owning job is a binary search away.
@@ -704,7 +947,10 @@ pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
     for j in jobs {
         let (blk_elems, blk_bytes) = j.dtype.block().expect("fused dtype has a block size");
         assert_eq!(j.x.len(), j.n_in, "matvec_fused_batch: x length must equal n_in");
-        assert!(j.qx.is_none() || j.dtype == GgmlType::Q4_K, "matvec_fused_batch: qx only valid for Q4_K");
+        assert!(
+            j.qx.is_none() || matches!(j.dtype, GgmlType::Q4_K | GgmlType::Q6_K),
+            "matvec_fused_batch: qx only valid for Q4_K/Q6_K"
+        );
         assert_eq!(j.n_in % blk_elems as usize, 0, "matvec_fused_batch: n_in not a block multiple");
         starts.push(total);
         row_bytes.push((j.n_in / blk_elems as usize) * blk_bytes as usize);
@@ -718,9 +964,11 @@ pub fn matvec_fused_batch(jobs: &[FusedJob], out: &mut [f32]) {
         let local = gr - starts[j];
         let job = &jobs[j];
         let rb = &job.w[local * row_bytes[j]..(local + 1) * row_bytes[j]];
-        *o = match job.qx {
-            Some(q8) => dot_q4k_row_q8(rb, q8),
-            None => fused_row_dot(job.dtype, rb, job.x),
+        *o = match (job.qx, job.dtype) {
+            (Some(q8), GgmlType::Q4_K) => dot_q4k_row_q8(rb, q8),
+            (Some(q8), GgmlType::Q6_K) => dot_q6k_row_q8(rb, q8),
+            // `qx` is only set for Q4_K/Q6_K (asserted above); any other Some is unreachable.
+            (_, _) => fused_row_dot(job.dtype, rb, job.x),
         };
     };
     if total < PAR_MIN_ROWS {
@@ -822,10 +1070,9 @@ mod tests {
         assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {reference}", y[0]);
     }
 
-    #[test]
-    fn matvec_q6k_fused_matches_dequant() {
-        // A non-trivial Q6_K block (varied scales incl. negatives, varied quants) dotted
-        // against varied x: the fused path must match dequantize-then-dot to f32 tolerance.
+    /// A non-trivial Q6_K block (varied scales incl. negatives, varied quants) + varied x,
+    /// reused by the f32-path and Q8-path tests below.
+    fn q6k_test_block() -> (Vec<u8>, Vec<f32>) {
         let mut block = vec![0u8; 210];
         block[208..210].copy_from_slice(&0x3c00u16.to_le_bytes()); // d = 1.0
         for (i, b) in block[0..128].iter_mut().enumerate() {
@@ -838,13 +1085,33 @@ mod tests {
             *b = (j.wrapping_mul(29).wrapping_add(3)) as u8; // i8 scales (some negative)
         }
         let x: Vec<f32> = (0..256).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+        (block, x)
+    }
 
+    #[test]
+    fn fused_row_dot_q6k_matches_dequant() {
+        // The f32 fused path (still used by `matvec_fused_batch`'s `None` arm) must match
+        // dequantize-then-dot to f32 tolerance.
+        let (block, x) = q6k_test_block();
         let weights = dequant::dequantize(GgmlType::Q6_K, &block, 256);
         let reference: f32 = weights.iter().zip(&x).map(|(&w, &xi)| w * xi).sum();
+        let got = fused_row_dot(GgmlType::Q6_K, &block, &x);
+        assert!((got - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{got} vs {reference}");
+    }
+
+    #[test]
+    fn matvec_q6k_q8_matches_quantized_reference() {
+        // matvec's Q6_K path is now the Q8-activation integer dot (like Q4_K). It should equal the
+        // exact dot of the dequantized weights with the Q8-rounded activations (`sx · q_x`) — i.e.
+        // the only error vs true is the int8 quantization of x, not the integer dot itself.
+        let (block, x) = q6k_test_block();
+        let weights = dequant::dequantize(GgmlType::Q6_K, &block, 256);
+        let a = quantize_q8(&x);
+        let reference: f32 = weights.iter().zip(&a.q).map(|(&w, &q)| w * (a.scales[0] * q as f32)).sum();
 
         let mut y = [0.0f32];
         matvec(GgmlType::Q6_K, &block, 256, 1, &x, &mut y);
-        assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {}", y[0], reference);
+        assert!((y[0] - reference).abs() <= 1e-3 * reference.abs().max(1.0), "{} vs {reference}", y[0]);
     }
 
     #[test]
@@ -1021,10 +1288,100 @@ mod tests {
         );
     }
 
+    /// Scalar fp32 reference for one Q6_K block: fully dequantize then compute the true dot.
+    fn ref_dot_q6k_block_fp32(block: &[u8], x: &[f32]) -> f32 {
+        let mut weights = [0.0f32; 256];
+        dequant::dequantize_q6_k_block(block, &mut weights);
+        weights.iter().zip(x).map(|(&w, &xi)| w * xi).sum()
+    }
+
+    /// A deterministic, realistically-scaled Q6_K block + activations for the precision test.
+    /// Small super-block `d` and modest i8 sub-block scales keep the dequantized weights in a
+    /// transformer-like range (~±0.25) and the activations O(1); a fixed-seed LCG fills the
+    /// quants/scales/x so the measured error is stable run-to-run.
+    fn realistic_q6k_block() -> (Vec<u8>, Vec<f32>) {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+
+        let mut block = vec![0u8; 210];
+        block[208..210].copy_from_slice(&0x1c00u16.to_le_bytes()); // d ≈ 0.00391 (f16)
+        for b in block[0..128].iter_mut() {
+            *b = next() as u8; // ql: full byte range
+        }
+        for b in block[128..192].iter_mut() {
+            *b = next() as u8; // qh
+        }
+        // i8 sub-block scales in ~[8, 40): modest magnitude, no maxed-out scales.
+        for b in block[192..208].iter_mut() {
+            *b = (8 + next() % 32) as u8;
+        }
+        // Activations: O(1), centered near zero — like a residual-stream vector.
+        let x: Vec<f32> = (0..256).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+        (block, x)
+    }
+
+    #[test]
+    fn dot_q6k_block_q8_precision_vs_fp32() {
+        // The Q6_K Q8-activation integer dot vs the true fp32 dot (fully dequantized weights ·
+        // true x). With realistic weight scales and O(1) activations, the only error is the Q8
+        // quantization of x; the integer dot itself is exact. Inputs are deterministic, so the
+        // measured error is stable and bit-identical across platforms.
+        let (block, x) = realistic_q6k_block();
+        let reference = ref_dot_q6k_block_fp32(&block, &x);
+
+        let a = quantize_q8(&x);
+        let got = dot_q6k_block_q8(&block, &a.q[..256], a.scales[0]);
+
+        // Measured relative error here is 0.0057328 (≈0.57%) — the Q8 activation rounding is the
+        // only error (the integer dot is exact), in line with ggml's Q6_K×Q8_K accuracy. The
+        // result is deterministic and bit-identical across platforms (exact integer dot,
+        // deterministic IEEE scaling), so the bound is set tight to catch any regression early.
+        let rel = (got - reference).abs() / reference.abs();
+        assert!(
+            rel < 0.0062,
+            "dot_q6k_block_q8 vs fp32 ref: got={got:.6}, ref={reference:.6}, rel={rel:.7}"
+        );
+    }
+
+    #[test]
+    fn q6k_block_idot_portable_matches_buffered() {
+        // The portable `wide` *vectorized* fused unpack (the non-aarch64 decode kernel) must
+        // produce the same exact integer dot as the buffered scalar unpack + `wsd_q6k` (which the
+        // aarch64/batch paths use) — i.e. the vectorized 6-bit unpack is correct. Runs on any host.
+        for seed in 0..4 {
+            let block = &q6k_matrix(1, seed * 7)[..210];
+            let x: Vec<f32> = (0..256).map(|i| ((i * 13 + seed) % 17) as f32 * 0.05 - 0.4).collect();
+            let q8 = quantize_q8(&x);
+            let (wq, sc) = unpack_q6k_block(block);
+            let want = wsd_q6k(&wq, &q8.q[..256], &sc);
+            assert_eq!(q6k_block_idot_portable(block, &q8.q[..256]), want, "seed {seed}");
+        }
+    }
+
+    /// The AVX-512 VNNI block dot must equal the portable path bit-for-bit (both exact integers).
+    /// Only built/run when VNNI is enabled (e.g. `target-cpu=native` on a Zen 4 / Ice Lake+ host),
+    /// so it self-validates the `vpdpbusd` path on x86 hardware this dev machine (aarch64) can't run.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vnni", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    #[test]
+    fn q6k_block_idot_vnni_matches_portable() {
+        for seed in 0..4 {
+            let block = &q6k_matrix(1, seed * 7)[..210];
+            let x: Vec<f32> = (0..256).map(|i| ((i * 13 + seed) % 17) as f32 * 0.05 - 0.4).collect();
+            let q8 = quantize_q8(&x);
+            assert_eq!(
+                q6k_block_idot_vnni(block, &q8.q[..256]),
+                q6k_block_idot_portable(block, &q8.q[..256]),
+                "seed {seed}"
+            );
+        }
+    }
+
     /// `matmul` over `n_tokens` columns must be bit-for-bit identical to calling `matvec` once
     /// per token — the module's core claim (loop reordering, not a numeric change). Checks every
-    /// dtype path (Q4_K Q8-int, Q6_K f32-fused, F32 dequant) and both the serial and parallel
-    /// row branches.
+    /// dtype path (Q4_K + Q6_K Q8-int, F32 dequant) and both the serial and parallel row branches.
     fn assert_matmul_eq_per_token(dtype: GgmlType, w: &[u8], n_in: usize, n_out: usize, n_tokens: usize) {
         let x: Vec<f32> = (0..n_in * n_tokens).map(|i| ((i % 11) as f32 - 5.0) * 0.05).collect();
         let mut batched = vec![0.0f32; n_out * n_tokens];
@@ -1064,6 +1421,24 @@ mod tests {
         matvec_fused_batch(&jobs, &mut out);
         for o in 0..4 {
             assert_eq!(out[o], fused_row_dot(GgmlType::Q4_K, &w[o * 144..(o + 1) * 144], &x), "row {o}");
+        }
+    }
+
+    #[test]
+    fn matvec_fused_batch_q6k_with_qx_uses_int_dot() {
+        // A Q6_K job carrying a pre-quantized `qx` takes the Q8 integer dot (the `Some(_, Q6_K)`
+        // arm — the decode MoE `ffn_down` path), bit-for-bit equal to a standalone dot_q6k_row_q8.
+        // Two sizes hit both the serial (< PAR_MIN_ROWS) and parallel row branches.
+        let x: Vec<f32> = (0..256).map(|i| ((i % 5) as f32 - 2.0) * 0.07).collect();
+        let q8 = quantize_q8(&x);
+        for &n_out in &[4usize, 80] {
+            let w = q6k_matrix(n_out, 99);
+            let jobs = vec![FusedJob { dtype: GgmlType::Q6_K, w: &w, n_in: 256, n_out, x: &x, qx: Some(&q8) }];
+            let mut out = vec![0.0f32; n_out];
+            matvec_fused_batch(&jobs, &mut out);
+            for o in 0..n_out {
+                assert_eq!(out[o], dot_q6k_row_q8(&w[o * 210..(o + 1) * 210], &q8), "n_out {n_out} row {o}");
+            }
         }
     }
 }

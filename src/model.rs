@@ -504,12 +504,12 @@ impl Model {
         let mut jobs = Vec::with_capacity(2 * N_EXPERTS_USED);
         for &e in sel {
             let w = &gate_data[e * gate_stride..(e + 1) * gate_stride];
-            let qx = (gate_exps.ggml_type == GgmlType::Q4_K).then_some(&x_q8);
+            let qx = is_q8_int(gate_exps.ggml_type).then_some(&x_q8);
             jobs.push(FusedJob { dtype: gate_exps.ggml_type, w, n_in: HIDDEN, n_out: MOE_FF, x, qx });
         }
         for &e in sel {
             let w = &up_data[e * up_stride..(e + 1) * up_stride];
-            let qx = (up_exps.ggml_type == GgmlType::Q4_K).then_some(&x_q8);
+            let qx = is_q8_int(up_exps.ggml_type).then_some(&x_q8);
             jobs.push(FusedJob { dtype: up_exps.ggml_type, w, n_in: HIDDEN, n_out: MOE_FF, x, qx });
         }
         let mut gate_up = vec![0.0f32; 2 * N_EXPERTS_USED * MOE_FF];
@@ -527,7 +527,7 @@ impl Model {
         // activation row), then weighted-sum the results in selection order (as before). Each
         // expert has a distinct activation, so quantize them one-per-expert (when down is Q4_K).
         let down_data = self.data(down_exps);
-        let down_q8: Vec<Q8Vec> = if down_exps.ggml_type == GgmlType::Q4_K {
+        let down_q8: Vec<Q8Vec> = if is_q8_int(down_exps.ggml_type) {
             (0..N_EXPERTS_USED).map(|i| quantize_q8(&act_all[i * MOE_FF..(i + 1) * MOE_FF])).collect()
         } else {
             Vec::new()
@@ -587,6 +587,12 @@ impl Model {
 /// `"blk.{layer}.{suffix}"` — a per-layer tensor name.
 fn name(layer: usize, suffix: &str) -> String {
     format!("blk.{layer}.{suffix}")
+}
+
+/// Whether a weight dtype takes the Q8-activation integer dot (so a shared `x` should be
+/// pre-quantized once and passed as [`FusedJob::qx`]). The K-quants do; F32/F16 don't.
+fn is_q8_int(dtype: GgmlType) -> bool {
+    matches!(dtype, GgmlType::Q4_K | GgmlType::Q6_K)
 }
 
 /// Per-head RMSNorm (over head_dim) then NEOX RoPE, in place over a packed `n_heads ×
