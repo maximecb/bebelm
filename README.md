@@ -192,15 +192,20 @@ agent.assistant_turn(|id, text| {
 `agent.clear()` resets the conversation (keeping the weights); `agent.history()` returns the
 full token transcript.
 
-**Cloning** — `Agent` implements `Clone`, so a prefilled prompt (e.g. a system prompt plus a
-few example turns) can be built and prefilled once, then cheaply forked into several
-independent continuations — each clone keeps its own transcript and KV/conv caches, and
-generating on one doesn't affect the others:
+**Prefilling** — `agent.prefill()` runs the model over the appended-but-unprocessed prompt to
+warm the KV/conv caches *without* decoding. `generate` prefills lazily anyway, so this is purely
+an optimization for the fork-many pattern below: warm a shared prefix once, then `clone` it.
+Prefilling never changes what the model produces.
+
+**Cloning** — `Agent` implements `Clone`, so a shared prefix (e.g. a system prompt plus a few
+example turns) can be built and prefilled once, then cheaply forked into several independent
+continuations — each clone keeps its own transcript and KV/conv caches, and generating on one
+doesn't affect the others:
 
 ```rust
 let mut base = Agent::new(&model).greedy();
-base.append_user("You are a terse assistant. Answer in one word where possible.");
-base.assistant_turn(|_, _| {});   // prefill the shared prefix once
+base.append_system("You are a terse assistant. Answer in one word where possible.");
+base.prefill();   // warm the shared prefix into the caches once, without generating
 
 let mut a = base.clone();
 let mut b = base.clone();

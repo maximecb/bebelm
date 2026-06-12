@@ -87,7 +87,8 @@ pub struct Turn {
 ///
 /// `Agent` is [`Clone`]: cloning copies the transcript and caches, so a prefilled prompt (e.g.
 /// a system prompt plus a few example turns) can be built once and cheaply forked into several
-/// independent continuations without re-running the prefill for the shared prefix.
+/// independent continuations without re-running the prefill for the shared prefix. Call
+/// [`prefill`](Self::prefill) before cloning to warm that shared prefix into the caches first.
 #[derive(Clone)]
 pub struct Agent<'m> {
     model: &'m Model,
@@ -328,6 +329,27 @@ impl<'m> Agent<'m> {
         }
     }
 
+    /// Prefill the appended-but-unprocessed prompt into the caches without decoding, leaving the
+    /// transcript unchanged. Use this to warm a shared prefix before [`clone`](Clone::clone)ing:
+    /// each fork then continues from the prefilled state instead of re-running the prefill. Since
+    /// [`generate`](Self::generate) prefills lazily anyway, calling this is purely an optimization
+    /// for the build-once-fork-many pattern — it never changes what the model produces.
+    ///
+    /// One token of the pending tail is intentionally left unprefilled: [`generate`](Self::generate)
+    /// consumes it as the seed for its first decode step. So `prefill` immediately followed by
+    /// `generate` does exactly the same work as `generate` alone.
+    pub fn prefill(&mut self) {
+        // Absorb every pending token except the last; the trailing token stays pending so the next
+        // `generate` still has a token to seed its decode loop (its >= 1-pending-token invariant).
+        let start = self.cache.pos;
+        let end = self.history.len().saturating_sub(1);
+        if start >= end {
+            return;
+        }
+        let rest = &self.history[start..end];
+        Self::absorb(self.model, &mut self.cache, rest, self.max_context);
+    }
+
     /// Prefill any appended-but-unprocessed tokens, then decode a continuation until the model
     /// emits EOS or hits `max_gen`. Past `max_context` the KV window slides (oldest context
     /// dropped) rather than stopping. Visible tokens are appended to the transcript and streamed
@@ -340,21 +362,8 @@ impl<'m> Agent<'m> {
         let (&last, rest) = self.history[self.cache.pos..]
             .split_last()
             .expect("generate: no pending tokens to generate from");
-        // Prefill every pending token except the last. When the whole batch fits the KV window
-        // (no mid-prefill sliding), run it as a batched GEMM in chunks (opt 9f) — bit-identical to
-        // the per-token path but with each weight read once per chunk instead of once per token.
-        // If the window would slide mid-prefill, fall back to the per-token loop so the eviction
-        // points match exactly.
-        if self.cache.kv_len() + rest.len() <= self.max_context {
-            for chunk in rest.chunks(PREFILL_CHUNK) {
-                self.model.run_layers_batch(chunk, &mut self.cache);
-            }
-        } else {
-            for &tok in rest {
-                self.model.run_layers(tok, &mut self.cache);
-                Self::trim_context(&mut self.cache, self.max_context);
-            }
-        }
+        // Prefill every pending token except the last (its logits seed the decode loop below).
+        Self::absorb(self.model, &mut self.cache, rest, self.max_context);
         let mut logits = self.model.forward_step(last, &mut self.cache);
         Self::trim_context(&mut self.cache, self.max_context);
         let prefill = t_prefill.elapsed();
@@ -434,6 +443,25 @@ impl<'m> Agent<'m> {
             decode,
         };
         Turn { ids, text, stats, stop }
+    }
+
+    /// Absorb `tokens` — the positions immediately following `cache.pos` — into the KV / conv
+    /// caches, advancing `cache.pos` past them. When the whole batch fits the KV window (no
+    /// mid-prefill sliding), run it as a batched GEMM in chunks (opt 9f): bit-identical to the
+    /// per-token path, but each weight is read once per chunk instead of once per token. If the
+    /// window would slide mid-prefill, fall back to the per-token loop so the eviction points
+    /// match exactly.
+    fn absorb(model: &Model, cache: &mut Cache, tokens: &[u32], max_context: usize) {
+        if cache.kv_len() + tokens.len() <= max_context {
+            for chunk in tokens.chunks(PREFILL_CHUNK) {
+                model.run_layers_batch(chunk, cache);
+            }
+        } else {
+            for &tok in tokens {
+                model.run_layers(tok, cache);
+                Self::trim_context(cache, max_context);
+            }
+        }
     }
 
     /// Slide the KV attention window down to `max_context` positions once it grows past the cap,

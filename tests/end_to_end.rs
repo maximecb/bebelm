@@ -202,6 +202,46 @@ fn clone_forks_independent_continuations() {
     );
 }
 
+/// `prefill` warms the shared prefix into the caches without changing what the model produces:
+/// forks cloned from a prefilled base decode the *same* tokens a non-prefilled agent would, and
+/// their first turn re-prefills only the tokens appended after the fork (its reported
+/// `prompt_tokens` drops to just the assistant framing plus the one deferred seed token).
+#[test]
+#[ignore = "loads the full ~5.2 GB GGUF; run with `cargo test --release -- --ignored`"]
+fn prefill_warms_shared_prefix_without_changing_output() {
+    let model = load_model();
+    let prompt = "List three primary colors, one per line.";
+
+    // Reference: a fresh agent that never calls `prefill` — generation prefills lazily.
+    let mut plain = Agent::new(&model).greedy().max_think(200).max_gen(64);
+    plain.append_user(prompt);
+    let plain_turn = plain.assistant_turn(|_id, _piece| {});
+
+    // Build the same prompt, warm it into the caches, then fork twice.
+    let mut base = Agent::new(&model).greedy().max_think(200).max_gen(64);
+    base.append_user(prompt);
+    base.prefill();
+    let mut fork_a = base.clone();
+    let mut fork_b = base.clone();
+    let turn_a = fork_a.assistant_turn(|_id, _piece| {});
+    let turn_b = fork_b.assistant_turn(|_id, _piece| {});
+
+    assert!(!plain_turn.ids.is_empty(), "expected the model to generate at least one token");
+    // Prefilling must not change the output: prefilled forks decode the same tokens as the
+    // non-prefilled reference, and the two independent forks agree with each other.
+    assert_eq!(turn_a.ids, plain_turn.ids, "prefill changed the generated tokens");
+    assert_eq!(turn_a.ids, turn_b.ids, "two forks of one prefilled base should decode identically");
+    // The fork already had the prompt in its caches, so its turn only prefills the freshly appended
+    // assistant framing (plus the one deferred seed token) — far fewer than the plain agent, which
+    // prefills the whole prompt on its first turn.
+    assert!(
+        turn_a.stats.prompt_tokens < plain_turn.stats.prompt_tokens,
+        "prefilled fork should prefill fewer prompt tokens ({}) than the non-prefilled agent ({})",
+        turn_a.stats.prompt_tokens,
+        plain_turn.stats.prompt_tokens,
+    );
+}
+
 /// Function calling, end to end: register an `add` tool, ask a question that needs it, and run
 /// the agentic loop. This exercises the whole tool path — schema emission into the system block,
 /// the model emitting a call between `<|tool_call_start|>`/`<|tool_call_end|>`, parsing and
