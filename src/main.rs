@@ -30,12 +30,14 @@ fn main() -> ExitCode {
     let result: Cmd = match args.get(1).map(String::as_str) {
         Some("generate") => cmd_generate(&path, &args[2..]),
         Some("chat") => chat::cmd_chat(&path, &args[2..]),
+        Some("ask") => chat::cmd_ask(&path, &args[2..]),
         _ => {
             eprintln!("bebelm — CPU-only LFM2.5-8B-A1B inference\n");
             eprintln!("usage:");
             eprintln!("  bebelm generate [opts] <prompt>...   text completion of a prompt");
             eprintln!("  bebelm chat     [opts]               interactive chat (streams thinking + reply)");
-            eprintln!("\n  opts (both): --greedy  --max-gen N  --max-think N  --no-think  --num-threads N");
+            eprintln!("  bebelm ask      [opts] <question>... single-turn chat (streams thinking + reply)");
+            eprintln!("\n  opts (all): --greedy  --max-gen N  --max-think N  --no-think  --hide-think  --num-threads N");
             eprintln!("\nweights file: $BEBELM_WEIGHTS_FILE (default {DEFAULT_WEIGHTS_FILE})");
             return ExitCode::FAILURE;
         }
@@ -67,8 +69,19 @@ fn cmd_generate(path: &str, args: &[String]) -> Cmd {
     std::io::stdout().flush().ok();
 
     // Stream each token's text to stdout as it is generated.
-    let turn = agent.generate(|_id, piece| {
-        print!("{piece}");
+    let turn = agent.generate(|id, piece| {
+        if opts.hide_think {
+            // This is a simple text completion (generate), but we still honor --hide-think:
+            // suppress anything between <think> and </think>.
+            static mut THINKING: bool = false;
+            unsafe {
+                if id == bebelm::tokenizer::TOKEN_THINK { THINKING = true; }
+                if !THINKING { print!("{piece}"); }
+                if id == bebelm::tokenizer::TOKEN_THINK_END { THINKING = false; }
+            }
+        } else {
+            print!("{piece}");
+        }
         std::io::stdout().flush().ok();
     });
     println!(); // end the streamed line
@@ -91,12 +104,13 @@ fn cmd_generate(path: &str, args: &[String]) -> Cmd {
 }
 
 /// Options shared by `generate` and `chat`, parsed from command-line flags.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct AgentOptions {
     max_gen: Option<usize>,
     /// Reasoning-token budget; `Some(0)` for `--no-think`.
     max_think: Option<usize>,
     greedy: bool,
+    hide_think: bool,
 }
 
 impl AgentOptions {
@@ -121,7 +135,7 @@ impl AgentOptions {
 /// `--num-threads N` is handled here rather than via [`AgentOptions`]: it sizes rayon's global
 /// pool (a process-wide, one-shot setting), so it's applied as a side effect on sight — before
 /// any model load or parallel work — rather than threaded through the per-agent options.
-fn parse_agent_options(args: &[String]) -> Result<(AgentOptions, Vec<String>), Box<dyn Error>> {
+pub(crate) fn parse_agent_options(args: &[String]) -> Result<(AgentOptions, Vec<String>), Box<dyn Error>> {
     let mut opts = AgentOptions::default();
     let mut positional = Vec::new();
     let mut it = args.iter();
@@ -129,6 +143,7 @@ fn parse_agent_options(args: &[String]) -> Result<(AgentOptions, Vec<String>), B
         match arg.as_str() {
             "--greedy" => opts.greedy = true,
             "--no-think" => opts.max_think = Some(0),
+            "--hide-think" => opts.hide_think = true,
             "--max-gen" => {
                 let v = it.next().ok_or("--max-gen needs a value")?;
                 opts.max_gen = Some(v.parse().map_err(|_| format!("invalid --max-gen {v:?}"))?);

@@ -4,11 +4,11 @@
 
 use std::io::{self, IsTerminal, Write};
 
-use bebelm::agent::Agent;
+use bebelm::agent::{Agent, Turn};
 use bebelm::model::Model;
 use bebelm::tokenizer;
 
-use crate::{parse_agent_options, Cmd};
+use crate::{parse_agent_options, AgentOptions, Cmd};
 
 /// ANSI colors for the chat UI, blanked when stdout is not a terminal (e.g. piped to a file).
 /// The model's reply is shown in two colors: the `<think>…</think>` reasoning (`think`) and
@@ -43,7 +43,7 @@ impl Palette {
 /// reasoning shown in a different colour from the answer; the terminating `<|im_end|>` is
 /// suppressed. Sampling uses the model's recommended defaults unless overridden by flags
 /// (`--greedy`, `--max-gen`, `--max-think`, `--no-think`); there is no system prompt.
-pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
+pub fn cmd_chat(path: &str, args: &[String]) -> Cmd {
     let (opts, positional) = parse_agent_options(args)?;
     if !positional.is_empty() {
         return Err(format!("chat takes no prompt arguments; got {positional:?}").into());
@@ -92,23 +92,8 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
         // Blank line between the user's message and the model's reply.
         println!();
 
-        // Stream the reply. The model opens with a <think>...</think> reasoning block; colour
-        // that distinctly from the answer that follows. Start in the answer colour so a reply
-        // with no <think> block still reads correctly.
-        print!("{}", pal.answer);
-        io::stdout().flush().ok();
-        let turn = agent.assistant_turn(|id, text| {
-            if id == tokenizer::TOKEN_THINK {
-                print!("{}", pal.think);
-            }
-            print!("{text}");
-            if id == tokenizer::TOKEN_THINK_END {
-                println!(); // Blank line after the reasoning block.
-                print!("{}", pal.answer);
-            }
-            io::stdout().flush().ok();
-        });
-        println!("{}", pal.reset);
+        let turn = stream_assistant_turn(&mut agent, &pal, opts);
+
         println!(
             "{}({} tok, {:.1} tok/s){}",
             pal.dim,
@@ -120,6 +105,58 @@ pub(crate) fn cmd_chat(path: &str, args: &[String]) -> Cmd {
     }
 
     Ok(())
+}
+
+/// A single-turn chat: encode one message as a user turn, stream the assistant's reply, and exit.
+pub fn cmd_ask(path: &str, args: &[String]) -> Cmd {
+    let (opts, positional) = parse_agent_options(args)?;
+    let input = positional.join(" ");
+    if input.is_empty() {
+        return Err("need a question".into());
+    }
+
+    let model = Model::load(path)?;
+    let mut agent = opts.apply(Agent::new(&model));
+    let pal = Palette::detect();
+
+    // Expand any `@path` file references into inline fenced blocks before sending.
+    let msg = expand_file_refs(&input).map_err(|e| format!("error expanding file refs: {e}"))?;
+
+    agent.append_user(&msg);
+
+    stream_assistant_turn(&mut agent, &pal, opts);
+
+    Ok(())
+}
+
+/// Stream the model's reply, with optional reasoning suppression and colorized thinking blocks.
+fn stream_assistant_turn(agent: &mut Agent, pal: &Palette, opts: AgentOptions) -> Turn {
+    if !opts.hide_think {
+        print!("{}", pal.answer);
+        io::stdout().flush().ok();
+    }
+    let mut thinking = false;
+    let turn = agent.assistant_turn(|id, text| {
+        if id == tokenizer::TOKEN_THINK {
+            thinking = true;
+            if !opts.hide_think {
+                print!("{}", pal.think);
+            }
+        }
+        if !thinking || !opts.hide_think {
+            print!("{text}");
+        }
+        if id == tokenizer::TOKEN_THINK_END {
+            thinking = false;
+            if !opts.hide_think {
+                println!(); // Blank line after the reasoning block.
+                print!("{}", pal.answer);
+            }
+        }
+        io::stdout().flush().ok();
+    });
+    println!("{}", pal.reset);
+    turn
 }
 
 /// Expand `@path` file references in a typed line. The line is left untouched and the
