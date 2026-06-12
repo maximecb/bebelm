@@ -69,18 +69,24 @@ weights from `BEBELM_WEIGHTS_FILE` (see above).
   the `<think>...</think>` reasoning and the final answer in different colors. The KV / conv
   caches persist across turns, so each message only prefills its own new tokens. `Ctrl-D` or
   `/exit` to quit.
+- **`ask [options] <question>…`** — one-shot single-turn chat. Encodes the question as a user
+  turn, streams the model's reply (including reasoning), and exits.
 
-Both commands take the same options (sampling defaults to the model's recommended settings):
+All commands take the same options (sampling defaults to the model's recommended settings):
 
 - `--greedy` — deterministic greedy decoding instead of sampling.
 - `--max-gen N` — cap tokens generated per turn (default 2048).
 - `--max-think N` — cap the `<think>` reasoning block to N tokens (forces `</think>`).
 - `--no-think` — disable reasoning (equivalent to `--max-think 0`).
+- `--hide-think` — generate reasoning but hide it from the output (streams only the answer).
 - `--num-threads N` — cap the rayon worker pool (default: one per available core).
 
 ```sh
 # Interactive chat
 cargo run --release -- chat
+
+# One-shot single-turn chat
+cargo run --release -- ask "How do I implement binary search in Rust?"
 
 # One-shot completion
 cargo run --release -- generate --max-gen 64 "The capital of France is"
