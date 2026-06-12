@@ -75,7 +75,8 @@ weights from `BEBELM_WEIGHTS_FILE` (see above).
 All commands take the same options (sampling defaults to the model's recommended settings):
 
 - `--greedy` — deterministic greedy decoding instead of sampling.
-- `--max-gen N` — cap tokens generated per turn (default 2048).
+- `--max-gen N` — cap tokens generated per turn (default 2048); counts every generated token,
+  reasoning included, so a long `<think>` block eats into the budget left for the answer.
 - `--max-think N` — cap the `<think>` reasoning block to N tokens (forces `</think>`).
 - `--no-think` — disable reasoning (equivalent to `--max-think 0`).
 - `--hide-think` — generate reasoning but hide it from the output (streams only the answer).
@@ -129,7 +130,8 @@ model's recommended temperature 0.2 / top-k 80 / repeat-penalty 1.05):
 
 - `.greedy()` — deterministic argmax decoding.
 - `.temperature(f32)` / `.top_k(usize)` / `.repeat_penalty(f32)` — individual sampler knobs.
-- `.max_gen(usize)` — tokens generated per turn (default 2048).
+- `.max_gen(usize)` — tokens generated per turn (default 2048); counts reasoning tokens too, so
+  the `<think>` block and the answer share this budget.
 - `.max_context(usize)` — KV attention-window cap in tokens (default 32768); older context
   slides out rather than stopping generation.
 - `.max_think(usize)` — cap the `<think>` reasoning block (`0` ⇒ no reasoning block at all).
